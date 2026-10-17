@@ -1,0 +1,2164 @@
+#!/usr/bin/env python3
+"""
+cavac - Cyan CAVA terminal audio visualizer & music dashboard.
+
+Usage:
+    cavac                     Classic full-screen animated cyan spectrum.
+    cavac -meta, --meta       Minimalist music dashboard with high-res album artwork & dynamic theme.
+    cavac -meta --no-cover    Metadata dashboard without album artwork.
+    cavac -meta --compact     Compact metadata layout leaving more space for spectrum.
+"""
+
+import argparse
+import base64
+import colorsys
+import ctypes
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import unicodedata
+
+try:
+    from PIL import Image, ImageDraw
+except ImportError:
+    Image = None
+    ImageDraw = None
+
+CONFIG = os.path.expanduser("~/.config/cava/custom.conf")
+CACHE_DIR = os.path.expanduser("~/.cache/cavac/covers")
+CACHE_DIR_LYRICS = os.path.expanduser("~/.cache/cavac/lyrics")
+CACHE_SCHEMA_VERSION = 3
+
+# Classic Visualizer Configuration (Preserved 100%)
+BAR = "━"
+CYAN = "\033[38;5;39m"
+DEFAULT_CYAN_RGB = (0, 215, 255)
+RESET = "\033[0m"
+HEIGHT_RATIO = 0.75
+BAR_WIDTH = 2
+
+# Typography Colors
+WHITE_BOLD = "\033[1;37m"
+GRAY_DIM = "\033[38;5;244m"
+GRAY_TRACK = "\033[38;5;236m"
+YELLOW = "\033[38;5;220m"
+GRAY_VERY_DIM = "\033[38;5;238m"
+
+
+
+def format_time(seconds: float) -> str:
+    """Format seconds into MM:SS or HH:MM:SS."""
+    if seconds is None or seconds <= 0:
+        return "00:00"
+    total_sec = int(seconds)
+    m = total_sec // 60
+    s = total_sec % 60
+    if m >= 60:
+        h = m // 60
+        m = m % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def truncate_text(text: str, max_len: int) -> str:
+    """Truncate text with an ellipsis if it exceeds max visual length."""
+    if len(text) <= max_len:
+        return text
+    return text[:max(0, max_len - 1)] + "…"
+
+
+ANSI_ESCAPE_RE = re.compile(r'\033\[[0-9;]*[a-zA-Z]|\033\].*?\a')
+
+
+def visible_length(s: str) -> int:
+    """Calculate visible character length excluding ANSI escape codes."""
+    return len(ANSI_ESCAPE_RE.sub('', s))
+
+
+def pad_to_width(s: str, width: int) -> str:
+    """Pad string with trailing spaces to exact visible column width."""
+    vis = visible_length(s)
+    if vis < width:
+        return s + (" " * (width - vis))
+    return s
+
+
+def wrap_lyric_sentence(text: str, width: int, max_lines: int = 4) -> list[str]:
+    """Cleanly wrap a single lyric sentence by word boundaries without breaking words."""
+    if not text or width <= 0:
+        return []
+    words = text.split()
+    lines = []
+    curr = []
+    curr_len = 0
+    for w in words:
+        if not curr:
+            curr.append(w)
+            curr_len = len(w)
+        elif curr_len + 1 + len(w) <= width:
+            curr.append(w)
+            curr_len += 1 + len(w)
+        else:
+            lines.append(" ".join(curr))
+            curr = [w]
+            curr_len = len(w)
+    if curr:
+        lines.append(" ".join(curr))
+    return lines[:max_lines]
+
+
+
+def resize_bars(values, target):
+    """Resample CAVA data to target number of bars."""
+    if not values:
+        return []
+
+    if len(values) == target:
+        return values
+
+    result = []
+    for i in range(target):
+        pos = i * (len(values) - 1) / max(target - 1, 1)
+        left = int(pos)
+        right = min(left + 1, len(values) - 1)
+        fraction = pos - left
+        value = values[left] * (1 - fraction) + values[right] * fraction
+        result.append(int(value))
+
+    return result
+
+
+def expand_bars(values, width):
+    """
+    Make each frequency bar thicker while still filling
+    the entire terminal width.
+    """
+    target = max(1, width // BAR_WIDTH)
+    values = resize_bars(values, target)
+
+    output = []
+    for value in values:
+        for _ in range(BAR_WIDTH):
+            output.append(value)
+
+    return output[:width]
+
+
+def enhance_art_url(url: str) -> str:
+    """Request highest resolution available for remote artwork URLs."""
+    if not url:
+        return url
+    # YouTube Music Google user content: e.g. =w120-h120 -> =w800-h800
+    enhanced = re.sub(r"=w\d+-h\d+", "=w800-h800", url)
+    enhanced = re.sub(r"=s\d+", "=s800", enhanced)
+    # YouTube video thumbnail: hqdefault.jpg -> maxresdefault.jpg
+    if "i.ytimg.com" in url and "hqdefault.jpg" in url:
+        enhanced = enhanced.replace("hqdefault.jpg", "maxresdefault.jpg")
+    return enhanced
+
+
+def extract_dominant_color(image_path: str):
+    """Extract vibrant, contrast-adjusted dominant color from artwork."""
+    if not Image or not image_path or not os.path.isfile(image_path):
+        return DEFAULT_CYAN_RGB
+
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGB")
+            small = img.resize((50, 50), Image.Resampling.BOX)
+            colors = small.getcolors(50 * 50)
+            if not colors:
+                return DEFAULT_CYAN_RGB
+
+            candidates = []
+            for count, (r, g, b) in colors:
+                h, s, v = colorsys.rgb_to_hsv(r / 255.0, g / 255.0, b / 255.0)
+                sat_factor = s ** 1.3
+                val_factor = 1.0 - abs(v - 0.7)
+                if v < 0.25:
+                    sat_factor *= 0.1
+                score = count * sat_factor * val_factor
+                candidates.append((score, (r, g, b), (h, s, v)))
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            top_score, (r, g, b), (h, s, v) = candidates[0]
+
+            # Handle monochrome or desaturated images
+            if top_score <= 0.05 or s < 0.12:
+                brightest = max(colors, key=lambda c: sum(c[1]))
+                br, bg, bb = brightest[1]
+                if br < 80 and bg < 80 and bb < 80:
+                    return DEFAULT_CYAN_RGB
+                max_c = max(br, bg, bb, 1)
+                factor = 200.0 / max_c
+                return (min(255, int(br * factor)), min(255, int(bg * factor)), min(255, int(bb * factor)))
+
+            # Adjust brightness/saturation for legibility against black background
+            target_v = max(0.55, min(0.95, v))
+            target_s = max(0.40, min(1.0, s * 1.1))
+            adj_r, adj_g, adj_b = colorsys.hsv_to_rgb(h, target_s, target_v)
+            return (int(adj_r * 255), int(adj_g * 255), int(adj_b * 255))
+    except Exception:
+        return DEFAULT_CYAN_RGB
+
+
+def prepare_image_for_display(image_path: str, target_pixels=(280, 280)):
+    """Square-crop and Lanczos-resample artwork into PNG bytes for WezTerm."""
+    if not Image or not image_path or not os.path.isfile(image_path):
+        return None
+
+    try:
+        with Image.open(image_path) as img:
+            img = img.convert("RGBA")
+            w, h = img.size
+            if w != h:
+                min_dim = min(w, h)
+                left = (w - min_dim) // 2
+                top = (h - min_dim) // 2
+                img = img.crop((left, top, left + min_dim, top + min_dim))
+
+            resized = img.resize(target_pixels, Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            resized.save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def make_iterm2_image_escape(png_bytes: bytes, width_cells: int, height_cells: int) -> str:
+    """Generate WezTerm native iTerm2 inline image escape sequence."""
+    b64 = base64.b64encode(png_bytes).decode("ascii")
+    return f"\033]1337;File=inline=1;width={width_cells};height={height_cells};preserveAspectRatio=1:{b64}\a"
+
+
+class _XDisplay(ctypes.Structure):
+    pass
+
+
+class _XColor(ctypes.Structure):
+    _fields_ = [
+        ("pixel", ctypes.c_ulong),
+        ("red", ctypes.c_ushort),
+        ("green", ctypes.c_ushort),
+        ("blue", ctypes.c_ushort),
+        ("flags", ctypes.c_char),
+        ("pad", ctypes.c_char)
+    ]
+
+
+class MouseCursorHider:
+    """
+    Hides mouse cursor after inactivity timeout when inside target WezTerm window.
+    Restores normal cursor immediately upon mouse movement or on exit.
+    """
+
+    def __init__(self, timeout=3.0):
+        self.timeout = timeout
+        self.running = False
+        self.thread = None
+        self.is_hidden = False
+        self.target_wid = None
+        self.dpy = None
+        self.blank_cursor = None
+        self.lock = threading.Lock()
+
+        try:
+            self.x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            self.xfixes = ctypes.cdll.LoadLibrary("libXfixes.so.3")
+            self._setup_bindings()
+            self._init_x11()
+        except Exception:
+            self.dpy = None
+
+    def _setup_bindings(self):
+        self.x11.XOpenDisplay.restype = ctypes.POINTER(_XDisplay)
+        self.x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.x11.XCloseDisplay.argtypes = [ctypes.POINTER(_XDisplay)]
+        self.x11.XFlush.argtypes = [ctypes.POINTER(_XDisplay)]
+        self.x11.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.x11.XDefaultRootWindow.argtypes = [ctypes.POINTER(_XDisplay)]
+        self.x11.XInternAtom.restype = ctypes.c_ulong
+        self.x11.XInternAtom.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_char_p, ctypes.c_int]
+
+        self.xfixes.XFixesHideCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong]
+        self.xfixes.XFixesShowCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong]
+
+        self.x11.XDefineCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong, ctypes.c_ulong]
+        self.x11.XUndefineCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong]
+        self.x11.XCreateBitmapFromData.restype = ctypes.c_ulong
+        self.x11.XCreateBitmapFromData.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong, ctypes.c_char_p, ctypes.c_uint, ctypes.c_uint]
+        self.x11.XCreatePixmapCursor.restype = ctypes.c_ulong
+        self.x11.XCreatePixmapCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong, ctypes.c_ulong, ctypes.POINTER(_XColor), ctypes.POINTER(_XColor), ctypes.c_uint, ctypes.c_uint]
+        self.x11.XFreePixmap.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong]
+        self.x11.XFreeCursor.argtypes = [ctypes.POINTER(_XDisplay), ctypes.c_ulong]
+
+        self.x11.XGetWindowProperty.restype = ctypes.c_int
+        self.x11.XGetWindowProperty.argtypes = [
+            ctypes.POINTER(_XDisplay), ctypes.c_ulong, ctypes.c_ulong,
+            ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_void_p)
+        ]
+        self.x11.XFree.argtypes = [ctypes.c_void_p]
+
+        self.x11.XQueryPointer.argtypes = [
+            ctypes.POINTER(_XDisplay), ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint)
+        ]
+        self.x11.XQueryPointer.restype = ctypes.c_int
+
+        self.x11.XGetGeometry.argtypes = [
+            ctypes.POINTER(_XDisplay), ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint),
+            ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_uint)
+        ]
+        self.x11.XGetGeometry.restype = ctypes.c_int
+
+    def _get_window_property(self, win, atom_name):
+        atom = self.x11.XInternAtom(self.dpy, atom_name.encode("utf-8"), False)
+        actual_type = ctypes.c_ulong()
+        actual_format = ctypes.c_int()
+        nitems = ctypes.c_ulong()
+        bytes_after = ctypes.c_ulong()
+        prop = ctypes.c_void_p()
+
+        res = self.x11.XGetWindowProperty(
+            self.dpy, win, atom, 0, 1024, False, 0,
+            ctypes.byref(actual_type), ctypes.byref(actual_format),
+            ctypes.byref(nitems), ctypes.byref(bytes_after),
+            ctypes.byref(prop)
+        )
+        val = None
+        if res == 0 and prop.value:
+            if actual_format.value == 32 and nitems.value > 0:
+                val = ctypes.cast(prop, ctypes.POINTER(ctypes.c_ulong)).contents.value
+            elif actual_format.value == 8 and nitems.value > 0:
+                val = ctypes.string_at(prop, nitems.value)
+            self.x11.XFree(prop)
+        return val
+
+    def _find_target_window(self):
+        try:
+            active = self._get_window_property(self.root, "_NET_ACTIVE_WINDOW")
+            if active:
+                wm_class = self._get_window_property(active, "WM_CLASS")
+                if wm_class and b"wezterm" in wm_class.lower():
+                    return active
+        except Exception:
+            pass
+
+        try:
+            pid = os.getpid()
+            wpid = None
+            while pid > 1:
+                with open(f"/proc/{pid}/status") as f:
+                    content = f.read()
+                name = [l.split(":")[1].strip() for l in content.splitlines() if l.startswith("Name:")][0]
+                ppid = int([l.split(":")[1].strip() for l in content.splitlines() if l.startswith("PPid:")][0])
+                if "wezterm" in name.lower():
+                    wpid = pid
+                    break
+                pid = ppid
+
+            if wpid:
+                out = subprocess.run(["xdotool", "search", "--pid", str(wpid)], capture_output=True, text=True, timeout=0.5)
+                wids = [int(w) for w in out.stdout.split()]
+                if wids:
+                    return wids[0]
+        except Exception:
+            pass
+
+        try:
+            out = subprocess.run(["xdotool", "search", "--class", "org.wezfurlong.wezterm"], capture_output=True, text=True, timeout=0.5)
+            wids = [int(w) for w in out.stdout.split()]
+            if wids:
+                return wids[0]
+        except Exception:
+            pass
+
+        return None
+
+    def _init_x11(self):
+        self.dpy = self.x11.XOpenDisplay(None)
+        if not self.dpy:
+            return
+
+        self.root = self.x11.XDefaultRootWindow(self.dpy)
+        self.target_wid = self._find_target_window()
+
+        blank_byte = b"\x00"
+        pixmap = self.x11.XCreateBitmapFromData(self.dpy, self.root, blank_byte, 1, 1)
+        dummy = _XColor()
+        self.blank_cursor = self.x11.XCreatePixmapCursor(self.dpy, pixmap, pixmap, ctypes.byref(dummy), ctypes.byref(dummy), 0, 0)
+        self.x11.XFreePixmap(self.dpy, pixmap)
+
+    def _is_pointer_in_target(self):
+        if not self.dpy or not self.target_wid:
+            return False, (0, 0), 0
+
+        r_ret = ctypes.c_ulong()
+        x_ret = ctypes.c_int()
+        y_ret = ctypes.c_int()
+        w_ret = ctypes.c_uint()
+        h_ret = ctypes.c_uint()
+        b_ret = ctypes.c_uint()
+        d_ret = ctypes.c_uint()
+
+        res_geo = self.x11.XGetGeometry(
+            self.dpy, self.target_wid, ctypes.byref(r_ret),
+            ctypes.byref(x_ret), ctypes.byref(y_ret),
+            ctypes.byref(w_ret), ctypes.byref(h_ret),
+            ctypes.byref(b_ret), ctypes.byref(d_ret)
+        )
+        if res_geo == 0:
+            return False, (0, 0), 0
+
+        root_ret = ctypes.c_ulong()
+        child_ret = ctypes.c_ulong()
+        root_x = ctypes.c_int()
+        root_y = ctypes.c_int()
+        win_x = ctypes.c_int()
+        win_y = ctypes.c_int()
+        mask = ctypes.c_uint()
+
+        res_ptr = self.x11.XQueryPointer(
+            self.dpy, self.target_wid,
+            ctypes.byref(root_ret), ctypes.byref(child_ret),
+            ctypes.byref(root_x), ctypes.byref(root_y),
+            ctypes.byref(win_x), ctypes.byref(win_y),
+            ctypes.byref(mask)
+        )
+        if res_ptr == 0:
+            return False, (0, 0), 0
+
+        in_win = 0 <= win_x.value < w_ret.value and 0 <= win_y.value < h_ret.value
+        return in_win, (root_x.value, root_y.value), mask.value
+
+    def _hide_cursor(self):
+        if not self.is_hidden and self.dpy and self.target_wid:
+            try:
+                self.xfixes.XFixesHideCursor(self.dpy, self.target_wid)
+                if self.blank_cursor:
+                    self.x11.XDefineCursor(self.dpy, self.target_wid, self.blank_cursor)
+                self.x11.XFlush(self.dpy)
+                self.is_hidden = True
+            except Exception:
+                pass
+
+    def _show_cursor(self):
+        if self.is_hidden and self.dpy and self.target_wid:
+            try:
+                self.xfixes.XFixesShowCursor(self.dpy, self.target_wid)
+                self.x11.XUndefineCursor(self.dpy, self.target_wid)
+                self.x11.XFlush(self.dpy)
+                self.is_hidden = False
+            except Exception:
+                pass
+
+    def start(self):
+        if not self.dpy or not self.target_wid:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        last_pos = None
+        last_mask = 0
+        last_move_time = time.monotonic()
+
+        while self.running:
+            time.sleep(0.05)
+            try:
+                with self.lock:
+                    if not self.running:
+                        break
+                    in_target, pos, mask = self._is_pointer_in_target()
+
+                now = time.monotonic()
+
+                if pos != last_pos or mask != last_mask:
+                    last_pos = pos
+                    last_mask = mask
+                    last_move_time = now
+                    if self.is_hidden:
+                        with self.lock:
+                            self._show_cursor()
+                else:
+                    if in_target:
+                        if not self.is_hidden and (now - last_move_time >= self.timeout):
+                            with self.lock:
+                                self._hide_cursor()
+                    else:
+                        if self.is_hidden:
+                            with self.lock:
+                                self._show_cursor()
+            except Exception:
+                pass
+
+    def stop(self):
+        self.running = False
+        with self.lock:
+            if self.is_hidden:
+                self._show_cursor()
+            if self.blank_cursor and self.dpy:
+                try:
+                    self.x11.XFreeCursor(self.dpy, self.blank_cursor)
+                    self.blank_cursor = None
+                except Exception:
+                    pass
+            if self.dpy:
+                try:
+                    self.x11.XCloseDisplay(self.dpy)
+                    self.dpy = None
+                except Exception:
+                    pass
+
+
+class MetadataWorker:
+    """Background worker that continuously samples MPRIS media players and caches artwork."""
+
+    def __init__(self, no_cover=False):
+        self.no_cover = no_cover
+        self.lock = threading.Lock()
+        self.running = True
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+        self.last_art_url = None
+        self.last_art_path = None
+        self.snapshot = {
+            "title": "",
+            "artist": "",
+            "album": "",
+            "status": "Stopped",
+            "display_name": "",
+            "is_vivaldi": False,
+            "position": 0.0,
+            "length": 0.0,
+            "last_polled_time": time.monotonic(),
+            "art_url": "",
+            "artwork_path": None
+        }
+
+        # Perform initial poll so frame 1 already has metadata
+        self._poll()
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _detect_identity(self, player_name: str):
+        is_vivaldi = "vivaldi" in player_name.lower()
+        display_name = player_name.split(".")[0].capitalize()
+
+        m = re.search(r"instance(\d+)", player_name)
+        if m:
+            pid = m.group(1)
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().decode("utf-8", errors="ignore").lower()
+                    if "vivaldi" in cmd:
+                        is_vivaldi = True
+                        display_name = "Vivaldi"
+                    elif "youtube-music" in cmd or "youtube music" in cmd:
+                        display_name = "YouTube Music"
+                    elif "spotify" in cmd:
+                        display_name = "Spotify"
+                    elif "vlc" in cmd:
+                        display_name = "VLC"
+            except (OSError, IOError):
+                pass
+
+        return is_vivaldi, display_name
+
+    def _resolve_artwork(self, art_url: str):
+        if not art_url or self.no_cover:
+            return None
+
+        if art_url.startswith("file://"):
+            path = urllib.parse.unquote(urllib.parse.urlparse(art_url).path)
+            return path if os.path.isfile(path) and os.path.getsize(path) > 0 else None
+
+        if art_url.startswith(("/", "~")):
+            path = os.path.expanduser(art_url)
+            return path if os.path.isfile(path) and os.path.getsize(path) > 0 else None
+
+        if art_url.startswith(("http://", "https://")):
+            # Request enhanced resolution
+            fetch_url = enhance_art_url(art_url)
+            url_hash = hashlib.sha256(fetch_url.encode("utf-8")).hexdigest()[:20]
+            cached_dst = os.path.join(CACHE_DIR, f"{url_hash}.img")
+
+            if os.path.isfile(cached_dst) and os.path.getsize(cached_dst) > 0:
+                return cached_dst
+
+            try:
+                req = urllib.request.Request(fetch_url, headers={"User-Agent": "cavac-meta/2.0"})
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    data = resp.read(5 * 1024 * 1024)
+                    tmp_file = cached_dst + ".tmp"
+                    with open(tmp_file, "wb") as f:
+                        f.write(data)
+                    os.replace(tmp_file, cached_dst)
+                return cached_dst
+            except Exception:
+                # If enhanced URL failed, try original URL
+                if fetch_url != art_url:
+                    try:
+                        req = urllib.request.Request(art_url, headers={"User-Agent": "cavac-meta/2.0"})
+                        with urllib.request.urlopen(req, timeout=3.0) as resp:
+                            data = resp.read(5 * 1024 * 1024)
+                            tmp_file = cached_dst + ".tmp"
+                            with open(tmp_file, "wb") as f:
+                                f.write(data)
+                            os.replace(tmp_file, cached_dst)
+                        return cached_dst
+                    except Exception:
+                        return None
+                return None
+
+        return None
+
+    def _query_candidate(self, player_name: str):
+        fmt = "{{status}}\t{{title}}\t{{artist}}\t{{album}}\t{{mpris:artUrl}}\t{{position}}\t{{mpris:length}}"
+        try:
+            res = subprocess.run(
+                ["playerctl", "-p", player_name, "metadata", "--format", fmt],
+                capture_output=True,
+                text=True,
+                timeout=1.2
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                polled_at = time.monotonic()
+                parts = res.stdout.strip().split("\t")
+                while len(parts) < 7:
+                    parts.append("")
+                status, title, artist, album, art_url, pos_str, len_str = parts[:7]
+
+                try:
+                    pos_sec = int(pos_str) / 1_000_000.0 if pos_str.strip() else 0.0
+                except ValueError:
+                    pos_sec = 0.0
+
+                try:
+                    len_sec = int(len_str) / 1_000_000.0 if len_str.strip() else 0.0
+                except ValueError:
+                    len_sec = 0.0
+
+                is_vivaldi, display_name = self._detect_identity(player_name)
+
+                score = 10
+                st_low = status.lower()
+                if st_low == "playing":
+                    score = 100 if is_vivaldi else 90
+                elif st_low == "paused":
+                    score = 50 if is_vivaldi else 40
+
+                return {
+                    "player": player_name,
+                    "display_name": display_name,
+                    "is_vivaldi": is_vivaldi,
+                    "status": status,
+                    "title": title,
+                    "artist": artist,
+                    "album": album,
+                    "art_url": art_url,
+                    "position": pos_sec,
+                    "length": len_sec,
+                    "score": score,
+                    "polled_at": polled_at
+                }
+        except Exception:
+            pass
+        return None
+
+    def _poll(self):
+        try:
+            res = subprocess.run(["playerctl", "-l"], capture_output=True, text=True, timeout=1.0)
+            players = [p.strip() for p in res.stdout.splitlines() if p.strip()] if res.returncode == 0 else []
+
+            candidates = []
+            for p in players:
+                info = self._query_candidate(p)
+                if info:
+                    candidates.append(info)
+
+            candidates.sort(key=lambda x: x["score"], reverse=True)
+            now = time.monotonic()
+
+            if candidates:
+                best = candidates[0]
+                if best["art_url"] != self.last_art_url:
+                    self.last_art_url = best["art_url"]
+                    self.last_art_path = self._resolve_artwork(best["art_url"])
+
+                with self.lock:
+                    self.snapshot = {
+                        "title": best["title"],
+                        "artist": best["artist"],
+                        "album": best["album"],
+                        "status": best["status"],
+                        "display_name": best["display_name"],
+                        "is_vivaldi": best["is_vivaldi"],
+                        "position": best["position"],
+                        "length": best["length"],
+                        "last_polled_time": best.get("polled_at", now),
+                        "art_url": best["art_url"],
+                        "artwork_path": self.last_art_path
+                    }
+            else:
+                with self.lock:
+                    self.snapshot = {
+                        "title": "",
+                        "artist": "",
+                        "album": "",
+                        "status": "Stopped",
+                        "display_name": "",
+                        "is_vivaldi": False,
+                        "position": 0.0,
+                        "length": 0.0,
+                        "last_polled_time": now,
+                        "art_url": "",
+                        "artwork_path": None
+                    }
+        except Exception:
+            pass
+
+    def _run(self):
+        while self.running:
+            time.sleep(0.20)
+            self._poll()
+
+
+    def get_snapshot(self):
+        now = time.monotonic()
+        with self.lock:
+            s = dict(self.snapshot)
+
+        if s["status"].lower() == "playing":
+            elapsed = now - s["last_polled_time"]
+            est_pos = s["position"] + elapsed
+            if s["length"] > 0:
+                est_pos = min(s["length"], est_pos)
+            s["position"] = est_pos
+
+        return s
+
+    def stop(self):
+        self.running = False
+
+
+class VinylManager:
+    """Generates and manages animated rotating circular vinyl record frames with smooth 25 FPS rotation."""
+
+    def __init__(self, num_frames=120, target_speed_deg=36.0, fps=25.0):
+        self.num_frames = num_frames
+        self.target_speed = target_speed_deg  # 36°/s = 360° in 10s
+        self.current_speed = 0.0
+        self.current_angle = 0.0
+        self.frames = []
+        self.last_art_path = None
+        self.last_size = (0, 0)
+        self.lock = threading.Lock()
+        self.last_tick_time = time.monotonic()
+        self.frame_interval = 1.0 / fps
+        self.last_frame_emit_time = 0.0
+
+    def make_base_disc(self, artwork_path, size_px):
+        if not Image or not ImageDraw:
+            return None
+
+        disc = Image.new("RGBA", (size_px, size_px), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(disc)
+        center = size_px / 2.0
+        r_outer = size_px / 2.0
+        r_art = r_outer * 0.86
+        r_hole = r_outer * 0.12
+        r_spindle = r_outer * 0.04
+
+        # 1. Dark vinyl rim
+        draw.ellipse((0, 0, size_px, size_px), fill=(16, 16, 18, 255))
+        draw.ellipse((1, 1, size_px - 1, size_px - 1), outline=(32, 32, 36, 255), width=1)
+
+        # 2. Album artwork center label
+        if artwork_path and os.path.isfile(artwork_path):
+            try:
+                art = Image.open(artwork_path).convert("RGBA")
+                w, h = art.size
+                dim = min(w, h)
+                left = (w - dim) // 2
+                top = (h - dim) // 2
+                art = art.crop((left, top, left + dim, top + dim))
+                art_size = int(r_art * 2)
+                art = art.resize((art_size, art_size), Image.Resampling.LANCZOS)
+
+                mask = Image.new("L", (art_size, art_size), 0)
+                mask_draw = ImageDraw.Draw(mask)
+                mask_draw.ellipse((0, 0, art_size, art_size), fill=255)
+
+                paste_pos = (int(center - r_art), int(center - r_art))
+                disc.paste(art, paste_pos, mask)
+            except Exception:
+                pass
+        else:
+            # Fallback label when no artwork is available
+            draw.ellipse(
+                (center - r_art, center - r_art, center + r_art, center + r_art),
+                fill=(26, 26, 30, 255),
+                outline=(45, 45, 52, 255),
+                width=2
+            )
+
+        # 3. Concentric grooves overlay
+        groove = Image.new("RGBA", (size_px, size_px), (0, 0, 0, 0))
+        g_draw = ImageDraw.Draw(groove)
+        groove_count = 14
+        for i in range(groove_count):
+            radius = r_hole + (r_art - r_hole) * (i + 1) / (groove_count + 1)
+            alpha = 24 if i % 2 == 0 else 14
+            g_draw.ellipse(
+                (center - radius, center - radius, center + radius, center + radius),
+                outline=(255, 255, 255, alpha),
+                width=1
+            )
+
+        # Stylized subtle reflection sheen
+        for angle_deg in [45, 225]:
+            rad = math.radians(angle_deg)
+            for r_step in range(int(r_hole + 4), int(r_art - 2), 6):
+                sx = center + r_step * math.cos(rad)
+                sy = center + r_step * math.sin(rad)
+                g_draw.ellipse((sx - 1, sy - 1, sx + 1, sy + 1), fill=(255, 255, 255, 30))
+
+        disc = Image.alpha_composite(disc, groove)
+
+        # 4. Spindle hole & center ring
+        c_draw = ImageDraw.Draw(disc)
+        c_draw.ellipse(
+            (center - r_hole, center - r_hole, center + r_hole, center + r_hole),
+            fill=(22, 22, 25, 255),
+            outline=(55, 55, 60, 255),
+            width=2
+        )
+        c_draw.ellipse(
+            (center - r_spindle, center - r_spindle, center + r_spindle, center + r_spindle),
+            fill=(0, 0, 0, 0),
+            outline=(80, 80, 85, 255),
+            width=1
+        )
+
+        return disc
+
+    def update_track(self, artwork_path, size_px, width_cells, height_cells):
+        if not Image or not ImageDraw:
+            return
+
+        base = self.make_base_disc(artwork_path, size_px)
+        if not base:
+            return
+
+        # Generate frame 0 immediately for zero-lag initial display
+        buf0 = io.BytesIO()
+        base.save(buf0, format="PNG", compress_level=1)
+        b64_0 = base64.b64encode(buf0.getvalue()).decode("ascii")
+        seq0 = f"\033]1337;File=inline=1;width={width_cells};height={height_cells};preserveAspectRatio=1:{b64_0}\a"
+
+        with self.lock:
+            self.last_art_path = artwork_path
+            self.last_size = (width_cells, height_cells)
+            self.frames = [seq0]
+
+        # Background thread generates remaining rotation frames asynchronously
+        threading.Thread(
+            target=self._generate_rotation_frames,
+            args=(base, width_cells, height_cells),
+            daemon=True
+        ).start()
+
+    def _generate_rotation_frames(self, base_disc, width_cells, height_cells):
+        step_deg = 360.0 / self.num_frames
+        new_frames = []
+        for i in range(self.num_frames):
+            angle = i * step_deg
+            rot = base_disc.rotate(-angle, resample=Image.Resampling.BILINEAR) if angle != 0 else base_disc
+            buf = io.BytesIO()
+            rot.save(buf, format="PNG", compress_level=1)
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            seq = f"\033]1337;File=inline=1;width={width_cells};height={height_cells};preserveAspectRatio=1:{b64}\a"
+            new_frames.append(seq)
+
+        with self.lock:
+            self.frames = new_frames
+
+    def tick(self, is_playing: bool, now: float):
+        dt = max(0.0001, min(0.2, now - self.last_tick_time))
+        self.last_tick_time = now
+
+        # Smooth turntable acceleration and deceleration
+        if is_playing:
+            self.current_speed = min(self.target_speed, self.current_speed + 32.0 * dt)
+        else:
+            self.current_speed = max(0.0, self.current_speed - 32.0 * dt)
+
+
+        # Monotonic angular integration ensures no angle jumps
+        self.current_angle = (self.current_angle + self.current_speed * dt) % 360.0
+
+        if self.current_speed <= 0.05:
+            return None  # Stationary disc, do not re-emit frames
+
+        if now - self.last_frame_emit_time >= self.frame_interval:
+            self.last_frame_emit_time = now
+            with self.lock:
+                if not self.frames:
+                    return None
+                idx = int((self.current_angle / 360.0) * len(self.frames)) % len(self.frames)
+                return self.frames[idx]
+
+        return None
+
+
+VERSION_KEYWORDS = {
+    "remix", "cover", "live", "acoustic", "instrumental",
+    "slowed", "reverb", "sped up", "speed up", "edit", "karaoke",
+    "tribute", "parody", "mashup", "extended", "clean", "orchestral"
+}
+
+def clean_str(s: str) -> str:
+    """Normalize string for robust semantic comparison."""
+    if not s:
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
+    return s.lower().strip()
+
+def extract_base_title_and_tags(title: str):
+    """Separate base title from feat/version tags in parentheses/brackets."""
+    t_clean = clean_str(title)
+    found_tags = set()
+    for kw in VERSION_KEYWORDS:
+        if re.search(r'\b' + re.escape(kw) + r'\b', t_clean):
+            found_tags.add(kw)
+    base = re.sub(r'\(.*?\)', '', t_clean)
+    base = re.sub(r'\[.*?\]', '', base)
+    if " - " in base:
+        base = base.split(" - ", 1)[-1]
+    base = re.sub(r'[^\w\s]', ' ', base)
+    base = ' '.join(base.split())
+    return base, found_tags
+
+def extract_artists(artist_str: str) -> set[str]:
+    """Extract individual artist tokens/names from multi-artist string."""
+    a_clean = clean_str(artist_str)
+    parts = re.split(r'[,&+]|\s+feat\.?|\s+ft\.?|\s+featuring|\s+with|\s+x\s+', a_clean)
+    res = set()
+    for p in parts:
+        cleaned = re.sub(r'[^\w\s]', '', p).strip()
+        if cleaned:
+            res.add(cleaned)
+    return res
+
+def parse_duration_str(dur_str: str) -> float | None:
+    """Parse 'MM:SS' or 'HH:MM:SS' duration string into seconds."""
+    if not dur_str:
+        return None
+    parts = dur_str.strip().split(':')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except Exception:
+        pass
+    return None
+
+def validate_candidate(
+    active_title: str,
+    active_artist: str,
+    active_duration: float,
+    cand_title: str,
+    cand_artist: str,
+    cand_duration: float | None = None
+) -> tuple[bool, float, str]:
+    """
+    Validate candidate against active track.
+    Returns (is_valid, confidence_score, reason).
+    """
+    base_act, act_tags = extract_base_title_and_tags(active_title)
+    base_cand, cand_tags = extract_base_title_and_tags(cand_title)
+    
+    # 1. Reject unrequested remix/cover/slowed/etc versions
+    mismatched_tags = cand_tags - act_tags
+    if mismatched_tags:
+        return False, 0.0, f"Mismatched version tags: {mismatched_tags}"
+        
+    # 2. Artist verification
+    act_artists = extract_artists(active_artist)
+    cand_artists = extract_artists(cand_artist)
+    artist_match = False
+    for a in act_artists:
+        for c in cand_artists:
+            if a in c or c in a:
+                artist_match = True
+                break
+        if artist_match:
+            break
+    if not artist_match:
+        raw_act = clean_str(active_artist)
+        raw_cand = clean_str(cand_artist)
+        if raw_act and raw_cand and (raw_act in raw_cand or raw_cand in raw_act):
+            artist_match = True
+    if not artist_match:
+        return False, 0.0, f"Artist mismatch: active='{active_artist}' vs cand='{cand_artist}'"
+        
+    # 3. Title verification
+    tokens_act = set(base_act.split())
+    tokens_cand = set(base_cand.split())
+    if not tokens_act or not tokens_cand:
+        return False, 0.0, "Empty title tokens"
+    inter = tokens_act & tokens_cand
+    union = tokens_act | tokens_cand
+    title_score = len(inter) / len(union) if union else 0.0
+    if base_act == base_cand:
+        title_score = 1.0
+    elif tokens_act.issubset(tokens_cand) or tokens_cand.issubset(tokens_act):
+        title_score = max(title_score, 0.90)
+    if title_score < 0.60:
+        return False, title_score, f"Title similarity too low ({title_score:.2f}): '{base_act}' vs '{base_cand}'"
+        
+    # 4. Duration verification
+    dur_score = 1.0
+    if active_duration > 0 and cand_duration is not None and cand_duration > 0:
+        diff = abs(active_duration - cand_duration)
+        if diff <= 12.0:
+            dur_score = 1.0
+        elif diff <= 25.0:
+            dur_score = 0.85
+        elif diff <= 45.0:
+            dur_score = 0.60
+        else:
+            return False, 0.30, f"Duration mismatch: active={active_duration:.1f}s vs cand={cand_duration:.1f}s (diff={diff:.1f}s)"
+            
+    confidence = (title_score * 0.50) + (1.0 * 0.35) + (dur_score * 0.15)
+    return (confidence >= 0.75), confidence, "Match verified"
+
+
+def parse_lrc(lrc_text: str) -> list[dict]:
+    """
+    Parse LRC formatted text into sorted timestamped events:
+    [{'time': float, 'text': str}, ...]
+    
+    Supports:
+    - Standard [mm:ss.xx] and [mm:ss.xxx]
+    - Hours [hh:mm:ss.xx]
+    - Multiple timestamps on a single line: [00:12.00][00:24.00]Lyric line
+    - Offset tag [offset:+/-ms]
+    - Metadata tags [ti:], [ar:], [al:], [by:], [length:], etc.
+    - Preserves instrumental markers or empty text
+    - Deduplicates and sorts by timestamp ascending
+    """
+    if not lrc_text or not lrc_text.strip():
+        return []
+
+    lines = lrc_text.splitlines()
+    offset_sec = 0.0
+    for line in lines:
+        m_off = re.match(r"^\[offset:\s*([+-]?\d+)\s*\]", line.strip(), re.I)
+        if m_off:
+            try:
+                offset_sec = int(m_off.group(1)) / 1000.0
+            except ValueError:
+                pass
+
+    ts_pattern = re.compile(r"\[(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
+    meta_pattern = re.compile(r"^\[[a-zA-Z]+:.*\]$")
+
+    raw_events = []
+    for line in lines:
+        line_s = line.strip()
+        if not line_s or meta_pattern.match(line_s):
+            continue
+
+        matches = list(ts_pattern.finditer(line_s))
+        if not matches:
+            continue
+
+        text = ts_pattern.sub("", line_s).strip()
+        for m in matches:
+            hrs = int(m.group(1)) if m.group(1) else 0
+            mins = int(m.group(2))
+            secs = int(m.group(3))
+            ms_str = m.group(4) or "0"
+            frac = float(f"0.{ms_str}")
+            t = hrs * 3600.0 + mins * 60.0 + secs + frac + offset_sec
+            raw_events.append({"time": max(0.0, round(t, 3)), "text": text})
+
+    raw_events.sort(key=lambda x: x["time"])
+
+    # Deduplicate events with identical timestamps
+    deduped = []
+    for ev in raw_events:
+        if deduped and abs(deduped[-1]["time"] - ev["time"]) < 0.01:
+            if not deduped[-1]["text"] and ev["text"]:
+                deduped[-1] = ev
+            elif ev["text"] and ev["text"] != deduped[-1]["text"]:
+                deduped.append(ev)
+        else:
+            deduped.append(ev)
+
+    return deduped
+
+
+class YouTubeMusicLyricsProvider:
+    """Lyrics provider querying YouTube Music InnerTube API with candidate validation."""
+
+    def __init__(self, timeout: float = 4.0):
+        self.timeout = timeout
+        self.user_agent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    def _call_api(self, endpoint: str, data: dict) -> dict:
+        url = f"https://music.youtube.com/youtubei/v1/{endpoint}?prettyPrint=false"
+        payload = {
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "1.20240101.01.00",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            }
+        }
+        payload.update(data)
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": self.user_agent,
+                "Origin": "https://music.youtube.com",
+                "Referer": "https://music.youtube.com/"
+            }
+        )
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def fetch_lyrics(self, title: str, artist: str, duration: float = 0.0) -> dict | None:
+        clean_title = re.sub(r'\(.*?(official|video|audio|lyrics|remaster|version|live|feat\.|ft\.).*?\)', '', title, flags=re.I).strip()
+        clean_artist = re.split(r'[,&]|\s+feat\.?|\s+ft\.?', artist, flags=re.I)[0].strip() if artist else ""
+        query = f"{clean_artist} {clean_title}".strip() if clean_artist else clean_title
+        if not query:
+            return None
+
+        # 1. Search YouTube Music for tracks
+        try:
+            search_res = self._call_api("search", {"query": query})
+        except Exception:
+            return None
+
+        candidates = []
+        try:
+            tabs = search_res.get("contents", {}).get("tabbedSearchResultsRenderer", {}).get("tabs", [])
+            sections = tabs[0].get("tabRenderer", {}).get("content", {}).get("sectionListRenderer", {}).get("contents", []) if tabs else []
+            for sec in sections:
+                # Top result card
+                card = sec.get("musicCardShelfRenderer")
+                if card:
+                    runs = card.get("title", {}).get("runs", [])
+                    c_title = runs[0].get("text", "") if runs else ""
+                    vid = runs[0].get("navigationEndpoint", {}).get("watchEndpoint", {}).get("videoId") if runs else None
+                    sub_runs = card.get("subtitle", {}).get("runs", [])
+                    sub_texts = [r.get("text", "") for r in sub_runs]
+                    c_artist = ""
+                    c_dur = None
+                    is_song = any("Song" in t for t in sub_texts)
+                    for st in sub_texts:
+                        d = parse_duration_str(st)
+                        if d:
+                            c_dur = d
+                        elif st not in ("Song", "Video", " • ") and not st.endswith("views") and not st.endswith("plays"):
+                            if not c_artist:
+                                c_artist = st
+                    if vid and c_title:
+                        candidates.append({"vid": vid, "title": c_title, "artist": c_artist or artist, "dur": c_dur, "is_song": is_song})
+
+                # Item list
+                items = sec.get("itemSectionRenderer", {}).get("contents", []) or sec.get("musicShelfRenderer", {}).get("contents", [])
+                for it in items:
+                    r_item = it.get("musicResponsiveListItemRenderer")
+                    if r_item:
+                        flex = r_item.get("flexColumns", [])
+                        c_title = flex[0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"][0]["text"] if flex else ""
+                        nav = r_item.get("overlay", {}).get("musicItemThumbnailOverlayRenderer", {}).get("content", {}).get("musicPlayButtonRenderer", {}).get("playNavigationEndpoint", {})
+                        vid = nav.get("watchEndpoint", {}).get("videoId")
+                        if not vid and flex:
+                            r_runs = flex[0].get("musicResponsiveListItemFlexColumnRenderer", {}).get("text", {}).get("runs", [])
+                            if r_runs:
+                                vid = r_runs[0].get("navigationEndpoint", {}).get("watchEndpoint", {}).get("videoId")
+                        c_artist = ""
+                        c_dur = None
+                        is_song = False
+                        if len(flex) > 1:
+                            meta_runs = flex[1].get("musicResponsiveListItemFlexColumnRenderer", {}).get("text", {}).get("runs", [])
+                            is_song = any("Song" in r.get("text", "") for r in meta_runs)
+                            for mr in meta_runs:
+                                txt = mr.get("text", "").strip()
+                                d = parse_duration_str(txt)
+                                if d:
+                                    c_dur = d
+                                elif txt not in ("Song", "Video", "•", "") and not txt.endswith("views") and not txt.endswith("plays"):
+                                    if not c_artist:
+                                        c_artist = txt
+                        if vid and c_title and not any(c["vid"] == vid for c in candidates):
+                            candidates.append({"vid": vid, "title": c_title, "artist": c_artist, "dur": c_dur, "is_song": is_song})
+        except Exception:
+            pass
+
+        # Validate candidates
+        validated = []
+        for c in candidates:
+            cand_t = c["title"]
+            cand_a = c["artist"]
+            if " - " in cand_t:
+                parts = cand_t.split(" - ", 1)
+                cand_a = parts[0].strip()
+                cand_t = parts[1].strip()
+            ok, score, reason = validate_candidate(title, artist, duration, cand_t, cand_a, c["dur"])
+            if ok:
+                validated.append((c["is_song"], score, c, cand_t, cand_a))
+
+        # Sort: Songs first, then highest confidence score
+        validated.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        for is_song, score, cand, matched_t, matched_a in validated[:3]:
+            try:
+                next_res = self._call_api("next", {"videoId": cand["vid"]})
+                tabs = next_res.get("contents", {}).get("singleColumnMusicWatchNextResultsRenderer", {}).get("tabbedRenderer", {}).get("watchNextTabbedResultsRenderer", {}).get("tabs", [])
+                browse_id = None
+                for t in tabs:
+                    tr = t.get("tabRenderer", {})
+                    if tr.get("title") == "Lyrics":
+                        browse_id = tr.get("endpoint", {}).get("browseEndpoint", {}).get("browseId")
+                        break
+                if not browse_id:
+                    continue
+
+                browse_res = self._call_api("browse", {"browseId": browse_id})
+                contents = browse_res.get("contents", {})
+                if "messageRenderer" in contents:
+                    continue
+
+                sections = contents.get("sectionListRenderer", {}).get("contents", [])
+                for sec in sections:
+                    shelf = sec.get("musicDescriptionShelfRenderer")
+                    if shelf:
+                        runs = shelf.get("description", {}).get("runs", [])
+                        lyrics_text = runs[0].get("text", "") if runs else ""
+                        footer = ""
+                        if "footer" in shelf:
+                            footer = "".join(r.get("text", "") for r in shelf["footer"].get("runs", []))
+                        if lyrics_text.strip():
+                            timed_events = parse_lrc(lyrics_text)
+                            if timed_events:
+                                return {
+                                    "schema_version": CACHE_SCHEMA_VERSION,
+                                    "provider": "youtube_music",
+                                    "status": "synced",
+                                    "synced": True,
+                                    "lines": timed_events,
+                                    "source": footer or "YouTube Music",
+                                    "matched": {
+                                        "title": matched_t,
+                                        "artist": matched_a,
+                                        "vid": cand["vid"],
+                                        "confidence": score
+                                    }
+                                }
+                            else:
+                                plain_lines = [{"time": 0.0, "text": l.strip()} for l in lyrics_text.splitlines() if l.strip()]
+                                return {
+                                    "schema_version": CACHE_SCHEMA_VERSION,
+                                    "provider": "youtube_music",
+                                    "status": "unsynced",
+                                    "synced": False,
+                                    "lines": plain_lines,
+                                    "source": footer or "YouTube Music",
+                                    "matched": {
+                                        "title": matched_t,
+                                        "artist": matched_a,
+                                        "vid": cand["vid"],
+                                        "confidence": score
+                                    }
+                                }
+            except Exception:
+                continue
+
+        return None
+
+
+class LRCLIBLyricsProvider:
+    """Lyrics provider querying LRCLIB with candidate validation and timestamp parsing."""
+
+    def __init__(self, timeout: float = 4.0):
+        self.timeout = timeout
+        self.user_agent = "cavac/3.1 (https://github.com/cavac)"
+
+    def _query_api(self, url: str) -> dict | list | None:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 503:
+                time.sleep(0.3)
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
+                    with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    return None
+            return None
+        except Exception:
+            return None
+
+    def fetch_lyrics(self, title: str, artist: str, album: str = "", duration: float = 0.0) -> dict | None:
+        clean_title = re.sub(r'\(.*?(official|video|audio|lyrics|remaster|version|live|feat\.|ft\.).*?\)', '', title, flags=re.I).strip()
+        clean_artist = re.split(r'[,&]|\s+feat\.?|\s+ft\.?', artist, flags=re.I)[0].strip() if artist else ""
+        if not clean_title or not clean_artist:
+            return None
+
+        # 1. Exact match attempt via /api/get
+        get_params = {"track_name": clean_title, "artist_name": clean_artist}
+        if duration > 0:
+            get_params["duration"] = int(round(duration))
+        if album:
+            get_params["album_name"] = album
+        url_get = "https://lrclib.net/api/get?" + urllib.parse.urlencode(get_params)
+        data = self._query_api(url_get)
+
+        if isinstance(data, dict) and data.get("syncedLyrics"):
+            c_title = data.get("trackName", "")
+            c_artist = data.get("artistName", "")
+            c_dur = data.get("duration")
+            ok, score, reason = validate_candidate(title, artist, duration, c_title, c_artist, c_dur)
+            if ok:
+                events = parse_lrc(data["syncedLyrics"])
+                if events:
+                    return {
+                        "schema_version": CACHE_SCHEMA_VERSION,
+                        "provider": "lrclib",
+                        "status": "synced",
+                        "synced": True,
+                        "lines": events,
+                        "source": "LRCLIB",
+                        "matched": {
+                            "title": c_title,
+                            "artist": c_artist,
+                            "confidence": score
+                        }
+                    }
+
+        # 2. Search fallback via /api/search
+        query = f"{clean_artist} {clean_title}"
+        url_search = "https://lrclib.net/api/search?q=" + urllib.parse.quote(query)
+        results = self._query_api(url_search)
+
+        if isinstance(results, list):
+            best_candidate = None
+            best_score = 0.0
+            for item in results:
+                if not item.get("syncedLyrics"):
+                    continue
+                c_title = item.get("trackName", "")
+                c_artist = item.get("artistName", "")
+                c_dur = item.get("duration")
+                ok, score, reason = validate_candidate(title, artist, duration, c_title, c_artist, c_dur)
+                if ok and score > best_score:
+                    events = parse_lrc(item["syncedLyrics"])
+                    if events:
+                        best_score = score
+                        best_candidate = (item, score, c_title, c_artist, events)
+
+            if best_candidate:
+                item, score, m_title, m_artist, events = best_candidate
+                return {
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    "provider": "lrclib",
+                    "status": "synced",
+                    "synced": True,
+                    "lines": events,
+                    "source": "LRCLIB",
+                    "matched": {
+                        "title": m_title,
+                        "artist": m_artist,
+                        "confidence": score
+                    }
+                }
+
+        return None
+
+
+class LyricsWorker:
+    """Background worker fetching and serving verified timestamped lyrics."""
+
+    def __init__(self):
+        self.current_track = ("", "")
+        self.lyrics_data = {"schema_version": CACHE_SCHEMA_VERSION, "provider": "none", "status": "none", "synced": False, "lines": [], "source": None}
+        self.lock = threading.Lock()
+        self.running = True
+        self.pending_track = None
+        self.cond = threading.Condition()
+        self.ytm_provider = YouTubeMusicLyricsProvider()
+        self.lrc_provider = LRCLIBLyricsProvider()
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def update_track(self, title: str, artist: str, album: str = "", duration: float = 0.0):
+        key = (title.strip(), artist.strip())
+        if key == self.current_track:
+            return
+        with self.cond:
+            self.current_track = key
+            self.pending_track = (title, artist, album, duration)
+            with self.lock:
+                # Immediately reset lyrics data to loading on track change
+                self.lyrics_data = {
+                    "schema_version": CACHE_SCHEMA_VERSION,
+                    "provider": "none",
+                    "status": "loading",
+                    "synced": False,
+                    "lines": [],
+                    "source": None
+                }
+            self.cond.notify_all()
+
+    def _fetch_lyrics_pipeline(self, title: str, artist: str, album: str, duration: float):
+        if not title:
+            return {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "provider": "none",
+                "status": "unavailable",
+                "synced": False,
+                "lines": [],
+                "source": None,
+                "matched": None
+            }
+
+        # Cache key prefixed with version
+        key_raw = f"v{CACHE_SCHEMA_VERSION}:{artist.strip().lower()}:{title.strip().lower()}"
+        key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:24]
+        cache_path = os.path.join(CACHE_DIR_LYRICS, f"v{CACHE_SCHEMA_VERSION}_{key}.json")
+
+        if os.path.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as f:
+                    c_data = json.load(f)
+                    if c_data.get("schema_version") == CACHE_SCHEMA_VERSION and "provider" in c_data:
+                        c_track = c_data.get("track", {})
+                        if (c_track.get("title", "").strip().lower() == title.strip().lower() and
+                            c_track.get("artist", "").strip().lower() == artist.strip().lower()):
+                            return c_data
+            except Exception:
+                pass
+
+        record = None
+
+        # 1. Primary priority: YouTube Music InnerTube Provider (accept only if timestamped)
+        try:
+            ytm_res = self.ytm_provider.fetch_lyrics(title, artist, duration)
+            if ytm_res and ytm_res.get("synced") and ytm_res.get("lines"):
+                record = ytm_res
+        except Exception:
+            pass
+
+        # 2. Priority 2: LRCLIB Provider for genuine timestamped lyrics
+        if not record:
+            try:
+                lrc_res = self.lrc_provider.fetch_lyrics(title, artist, album, duration)
+                if lrc_res and lrc_res.get("synced") and lrc_res.get("lines"):
+                    record = lrc_res
+            except Exception:
+                pass
+
+        # 3. If neither provider returned verified timestamped lyrics, mark as unavailable
+        if not record:
+            record = {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "provider": "none",
+                "status": "unavailable",
+                "synced": False,
+                "lines": [],
+                "source": None,
+                "matched": None
+            }
+
+        # Store full metadata in cache
+        record["track"] = {
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "duration": duration
+        }
+        record["cached_at"] = time.time()
+
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+        except Exception:
+            pass
+
+        return record
+
+    def _run(self):
+        while self.running:
+            with self.cond:
+                while self.running and not self.pending_track:
+                    self.cond.wait(timeout=1.0)
+                if not self.running:
+                    break
+                track_info = self.pending_track
+                self.pending_track = None
+
+            if track_info:
+                title, artist, album, duration = track_info
+                result = self._fetch_lyrics_pipeline(title, artist, album, duration)
+                with self.cond:
+                    # Stale result protection: discard if active track changed during fetch
+                    if self.current_track != (title.strip(), artist.strip()):
+                        continue
+                with self.lock:
+                    self.lyrics_data = result
+
+    def get_snapshot(self):
+        with self.lock:
+            return dict(self.lyrics_data)
+
+    def get_active_index(self, pos_sec: float, duration: float = 0.0) -> int:
+        with self.lock:
+            lines = self.lyrics_data.get("lines", [])
+            synced = self.lyrics_data.get("synced", False)
+
+        if not lines or not synced:
+            return -1
+
+        if pos_sec < lines[0]["time"]:
+            return -1
+
+        active_idx = 0
+        for i, item in enumerate(lines):
+            if item["time"] <= pos_sec:
+                active_idx = i
+            else:
+                break
+        return active_idx
+
+    def stop(self):
+        self.running = False
+        with self.cond:
+            self.cond.notify_all()
+
+
+def format_single_lyric_panel(
+    lyrics_snap: dict,
+    pos_sec: float,
+    duration: float,
+    width: int,
+    accent_rgb: tuple,
+    compact: bool,
+    now: float,
+    last_change_time: float
+) -> list[str]:
+    """Format single active lyric sentence with clean native typography, word-wrapping, and true sync."""
+    r, g, b = accent_rgb
+    total_rows = 6 if compact else 7
+    panel = [""] * total_rows
+    mid = total_rows // 2
+
+    status = lyrics_snap.get("status", "none")
+    synced = bool(lyrics_snap.get("synced", False))
+    lines = lyrics_snap.get("lines", [])
+
+    # 1. Loading state
+    if status == "loading":
+        panel[mid] = f"{GRAY_DIM}Loading lyrics...{RESET}"
+        return panel
+
+    # 2. Unavailable / not synced
+    if not synced or status in ("none", "unavailable") or not lines:
+        panel[mid] = f"{GRAY_DIM}Synced lyrics unavailable{RESET}"
+        return panel
+
+    # 3. True timestamped synchronized lyrics
+    if pos_sec < lines[0]["time"]:
+        # Before first lyric line (instrumental intro)
+        panel[mid] = f"{GRAY_DIM}♪{RESET}"
+        return panel
+
+    active_idx = 0
+    for i, item in enumerate(lines):
+        if item["time"] <= pos_sec:
+            active_idx = i
+        else:
+            break
+
+    active_text = lines[active_idx]["text"].strip() if active_idx < len(lines) else ""
+    if not active_text:
+        # Instrumental section
+        panel[mid] = f"{GRAY_DIM}♪{RESET}"
+        return panel
+
+    # Soft subtle illumination on sentence transition (first 0.20s)
+    time_since_change = now - last_change_time
+    if time_since_change < 0.20:
+        fr, fg, fb = int(r * 0.70), int(g * 0.70), int(b * 0.70)
+        accent_code = f"\033[38;2;{fr};{fg};{fb}m"
+    else:
+        accent_code = f"\033[1;38;2;{r};{g};{b}m"
+
+    wrapped = wrap_lyric_sentence(active_text, width, max_lines=4)
+
+    # Vertical positioning: center pleasantly avoiding row 0
+    if compact:
+        start_row = 1 if len(wrapped) >= 3 else 2
+    else:
+        if len(wrapped) == 1:
+            start_row = 2
+        elif len(wrapped) == 2:
+            start_row = 2
+        else:
+            start_row = 1
+
+    for i, wl in enumerate(wrapped):
+        if start_row + i < total_rows:
+            panel[start_row + i] = f"{accent_code}{wl}{RESET}"
+
+    return panel
+
+
+
+def format_minimalist_metadata(meta, text_w: int, accent_rgb: tuple, compact: bool, rotate_no_cover_note: bool = False):
+    """Format right-hand metadata lines with clean, un-cluttered typography."""
+    title = meta.get("title", "") or "No Media Playing"
+    artist = meta.get("artist", "") or ""
+    album = meta.get("album", "") or ""
+    status = meta.get("status", "") or "Stopped"
+    player_name = meta.get("display_name", "") or "Media Player"
+    pos_sec = meta.get("position", 0.0)
+    len_sec = meta.get("length", 0.0)
+
+    r, g, b = accent_rgb
+    accent = f"\033[38;2;{r};{g};{b}m"
+
+    st_low = status.lower()
+    if st_low == "playing":
+        st_badge = f"{accent}▶ PLAYING{RESET}"
+    elif st_low == "paused":
+        st_badge = f"{YELLOW}⏸ PAUSED{RESET}"
+    else:
+        st_badge = f"{GRAY_DIM}◼ STOPPED{RESET}"
+
+    if rotate_no_cover_note:
+        st_badge = f"{st_badge}  {GRAY_DIM}(vinyl disabled by --no-cover){RESET}"
+
+    # Build minimalist thin progress bar
+    pos_str = format_time(pos_sec)
+    len_str = format_time(len_sec) if len_sec > 0 else "--:--"
+    overhead = len(pos_str) + len(len_str) + 4
+    bar_width = max(4, min(36, text_w - overhead))
+
+    if len_sec > 0:
+        pct = max(0.0, min(1.0, pos_sec / len_sec))
+        filled = int(round(pct * bar_width))
+    else:
+        filled = 0
+    empty = max(0, bar_width - filled)
+
+    prog_bar = f"{GRAY_DIM}{pos_str}{RESET}  {accent}{'━' * filled}{GRAY_TRACK}{'─' * empty}{RESET}  {GRAY_DIM}{len_str}{RESET}"
+
+    if compact:
+        # Compact layout (6 lines)
+        lines = [
+            f"{st_badge}  {GRAY_DIM}•  {player_name}{RESET}",
+            f"{WHITE_BOLD}{truncate_text(title, text_w)}{RESET}",
+            f"{accent}{truncate_text(artist, text_w)}{RESET}" if artist else "",
+            f"{GRAY_DIM}{truncate_text(album, text_w)}{RESET}" if (album and album.lower() != title.lower()) else "",
+            "",
+            prog_bar,
+        ]
+    else:
+        # Standard prominent layout (7 lines)
+        lines = [
+            f"{st_badge}  {GRAY_DIM}•  {player_name}{RESET}",
+            "",
+            f"{WHITE_BOLD}{truncate_text(title, text_w)}{RESET}",
+            f"{accent}{truncate_text(artist, text_w)}{RESET}" if artist else "",
+            f"{GRAY_DIM}{truncate_text(album, text_w)}{RESET}" if (album and album.lower() != title.lower()) else "",
+            "",
+            prog_bar,
+        ]
+
+    return lines
+
+
+
+def run_classic():
+    """Exact original cavac behavior."""
+    mouse_hider = MouseCursorHider(timeout=3.0)
+    mouse_hider.start()
+
+    cava = subprocess.Popen(
+        ["cava", "-p", CONFIG],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1
+    )
+
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+    try:
+        while True:
+            line = cava.stdout.readline()
+            if not line:
+                break
+
+            try:
+                values = [int(x) for x in line.split()]
+            except ValueError:
+                continue
+
+            terminal = shutil.get_terminal_size()
+            width = terminal.columns
+            height = max(1, int(terminal.lines * HEIGHT_RATIO))
+
+            values = expand_bars(values, width)
+            heights = [max(0, min(height, int(v / 1000 * height))) for v in values]
+
+            sys.stdout.write("\033[H")
+            for row in range(height, 0, -1):
+                line_output = []
+                for h in heights:
+                    if h >= row:
+                        line_output.append(CYAN + BAR + RESET)
+                    else:
+                        line_output.append(" ")
+                sys.stdout.write("".join(line_output) + "\033[K\n")
+
+            sys.stdout.write("\033[J")
+            sys.stdout.flush()
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        mouse_hider.stop()
+        sys.stdout.write("\033[?25h")
+        sys.stdout.write("\033[0m")
+        sys.stdout.flush()
+        cava.terminate()
+
+
+def run_meta(args):
+    """Artwork-first minimalist music dashboard mode with smooth vinyl, live progress, and minimal lyrics UI."""
+    worker = MetadataWorker(no_cover=args.no_cover)
+    mouse_hider = MouseCursorHider(timeout=3.0)
+    mouse_hider.start()
+
+    vinyl_mgr = VinylManager(num_frames=120, target_speed_deg=36.0, fps=25.0) if args.rotate else None
+    lyrics_worker = LyricsWorker() if args.lyrics else None
+
+    cava = subprocess.Popen(
+        ["cava", "-p", CONFIG],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1
+    )
+
+    cava_values = [0] * 80
+    cava_lock = threading.Lock()
+    cava_running = True
+
+    def cava_reader():
+        nonlocal cava_values
+        while cava_running:
+            line = cava.stdout.readline()
+            if not line:
+                break
+            try:
+                vals = [int(x) for x in line.split()]
+                with cava_lock:
+                    cava_values = vals
+            except ValueError:
+                pass
+
+    reader_thread = threading.Thread(target=cava_reader, daemon=True)
+    reader_thread.start()
+
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+    def cleanup():
+        nonlocal cava_running
+        cava_running = False
+        mouse_hider.stop()
+        worker.stop()
+        if lyrics_worker:
+            lyrics_worker.stop()
+        sys.stdout.write("\033[2J\033[?25h\033[0m")
+        sys.stdout.flush()
+        try:
+            cava.terminate()
+        except Exception:
+            pass
+
+    def sig_exit(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, sig_exit)
+    signal.signal(signal.SIGTERM, sig_exit)
+    signal.signal(signal.SIGHUP, sig_exit)
+
+    clock_hz = 25.0
+    tick_interval = 1.0 / clock_hz  # 0.040s
+
+    last_size = (0, 0)
+    last_art_path = None
+    last_track_info = ("", "")
+    cached_accent = DEFAULT_CYAN_RGB
+    cached_image_seq = None
+    cover_w = 0
+    cover_h = 0
+    img_row = 1
+    img_col = 1
+    meta_col = 1
+    meta_w = 10
+    lyrics_col = 1
+    lyrics_w = 0
+    meta_top = 1
+    pad_left = 1
+    is_compact = False
+    show_cover = False
+    show_lyrics = False
+    target_px = 180
+
+    last_progress_time = 0.0
+    last_active_lyric_idx = -1
+    last_lyric_change_time = 0.0
+    last_displayed_lyric_panel = []
+
+    try:
+        while True:
+            if cava.poll() is not None:
+                break
+
+            now = time.monotonic()
+
+            terminal = shutil.get_terminal_size()
+            term_w = terminal.columns
+            term_h = terminal.lines
+
+            snapshot = worker.get_snapshot()
+            art_path = snapshot.get("artwork_path")
+            track_info = (snapshot.get("title", ""), snapshot.get("artist", ""))
+
+            size_changed = (term_w, term_h) != last_size
+            art_changed = art_path != last_art_path
+            track_changed = track_info != last_track_info
+
+            if size_changed or art_changed or track_changed:
+                last_size = (term_w, term_h)
+                last_art_path = art_path
+                last_track_info = track_info
+
+                show_cover = not args.no_cover and term_w >= 50 and term_h >= 13
+                is_compact = args.compact or term_h < 22 or term_w < 78
+
+                if show_cover:
+                    if not is_compact and term_w >= 105 and term_h >= 26:
+                        # Large terminals: ~2 rows top pad, ~3 cols left pad, ~4 cols gap
+                        pad_top = 2
+                        pad_left = 3
+                        gap1 = 4
+                        cover_h = 12
+                        cover_w = 24
+                        target_px = 220
+                    elif not is_compact and term_w >= 80 and term_h >= 20:
+                        # Medium terminals: ~1 row top pad, ~2 cols left pad, ~3 cols gap
+                        pad_top = 1
+                        pad_left = 2
+                        gap1 = 3
+                        cover_h = 10
+                        cover_w = 20
+                        target_px = 180
+                    else:
+                        # Compact square cover
+                        pad_top = 1 if term_h >= 16 else 0
+                        pad_left = 2
+                        gap1 = 3
+                        cover_h = 8
+                        cover_w = 16
+                        target_px = 150
+
+                    img_row = 1 + pad_top
+                    img_col = 1 + pad_left
+                    meta_col = img_col + cover_w + gap1
+                    meta_top = img_row + (1 if cover_h >= 10 else 0)
+                else:
+                    pad_top = 1 if term_h >= 16 else 0
+                    pad_left = 3 if term_w >= 80 else (2 if term_w >= 50 else 1)
+                    gap1 = 3
+                    cover_h = 0
+                    cover_w = 0
+                    img_row = 1 + pad_top
+                    img_col = 1 + pad_left
+                    meta_col = 1 + pad_left
+                    meta_top = 1 + pad_top
+                    target_px = 180
+
+                # Extract dynamic accent color
+                if art_path and os.path.isfile(art_path):
+                    cached_accent = extract_dominant_color(art_path)
+                else:
+                    cached_accent = DEFAULT_CYAN_RGB
+
+                # Horizontal space allocation with generous separation pushing lyrics right
+                if args.lyrics:
+                    meta_w = 34 if is_compact else 36
+                    meta_end = meta_col + meta_w
+                    right_remaining = term_w - meta_end - pad_left
+                    if right_remaining >= 24:
+                        # Target generous gap of 12-20 columns on wide terminals
+                        gap2 = max(8, min(20, int(right_remaining * 0.28)))
+                        if right_remaining - gap2 < 18:
+                            gap2 = max(4, right_remaining - 18)
+                        lyrics_col = meta_end + gap2
+                        lyrics_w = max(14, term_w - lyrics_col - pad_left)
+                        show_lyrics = (lyrics_w >= 16)
+                    else:
+                        meta_w = max(24, term_w - meta_col - pad_left)
+                        gap2 = 0
+                        lyrics_col = 0
+                        lyrics_w = 0
+                        show_lyrics = False
+                else:
+                    meta_w = max(24, term_w - meta_col - pad_left)
+                    gap2 = 0
+                    lyrics_col = 0
+                    lyrics_w = 0
+                    show_lyrics = False
+
+                # Update lyrics worker on track change
+                if lyrics_worker and (track_changed or size_changed):
+                    lyrics_worker.update_track(
+                        snapshot.get("title", ""),
+                        snapshot.get("artist", ""),
+                        snapshot.get("album", ""),
+                        snapshot.get("length", 0.0)
+                    )
+                    last_active_lyric_idx = -1
+                    last_displayed_lyric_panel = []
+
+                # Prepare image or vinyl frames
+                cached_image_seq = None
+                if show_cover:
+                    if vinyl_mgr:
+                        vinyl_mgr.update_track(art_path, target_px, cover_w, cover_h)
+                    elif art_path and os.path.isfile(art_path):
+                        png_bytes = prepare_image_for_display(art_path, target_pixels=(target_px, target_px))
+                        if png_bytes:
+                            cached_image_seq = make_iterm2_image_escape(png_bytes, cover_w, cover_h)
+
+                # Clear screen cleanly on layout / track transition
+                sys.stdout.write("\033[2J")
+
+                # Initial artwork / vinyl frame render
+                if show_cover:
+                    if vinyl_mgr and vinyl_mgr.frames:
+                        sys.stdout.write(f"\033[{img_row};{img_col}H{vinyl_mgr.frames[0]}")
+                    elif cached_image_seq:
+                        sys.stdout.write(f"\033[{img_row};{img_col}H{cached_image_seq}")
+                    else:
+                        # Subtle minimalist placeholder
+                        r, g, b = cached_accent
+                        color = f"\033[38;2;{r};{g};{b}m"
+                        mid_row = cover_h // 2
+                        mid_col = cover_w // 2
+                        for r_idx in range(1, cover_h + 1):
+                            curr_r = img_row + r_idx - 1
+                            sys.stdout.write(f"\033[{curr_r};{img_col}H")
+                            if r_idx == mid_row:
+                                pad_l = max(0, mid_col - 1)
+                                pad_r = max(0, cover_w - pad_l - 2)
+                                sys.stdout.write(f"{' ' * pad_l}{color}♫ {RESET}{' ' * pad_r}")
+                            else:
+                                sys.stdout.write(" " * cover_w)
+
+                # Invalidate progress & lyrics cache to trigger immediate initial draw
+                last_progress_time = 0.0
+                last_displayed_lyric_panel = []
+                sys.stdout.flush()
+
+            # 1. Tick vinyl rotation animation (25 FPS)
+            if show_cover and vinyl_mgr:
+                is_playing = (snapshot.get("status", "").lower() == "playing")
+                rot_seq = vinyl_mgr.tick(is_playing, now)
+                if rot_seq:
+                    sys.stdout.write(f"\033[{img_row};{img_col}H{rot_seq}")
+
+            # 2. Render metadata & progress bar (refreshes at 5 Hz or on resize/track change)
+            if (now - last_progress_time >= 0.20) or size_changed or track_changed:
+                last_progress_time = now
+                rotate_no_cover = bool(args.rotate and args.no_cover)
+                meta_lines = format_minimalist_metadata(
+                    snapshot, meta_w, cached_accent, is_compact,
+                    rotate_no_cover_note=rotate_no_cover
+                )
+                for r_idx, mline in enumerate(meta_lines):
+                    row_num = meta_top + r_idx
+                    sys.stdout.write(f"\033[{row_num};{meta_col}H{pad_to_width(mline, meta_w)}")
+
+            # 3. Render single active lyric sentence on the right
+            if show_lyrics and lyrics_worker:
+                lyrics_snap = lyrics_worker.get_snapshot()
+                current_pos = snapshot.get("position", 0.0)
+                track_len = snapshot.get("length", 0.0)
+                active_idx = lyrics_worker.get_active_index(current_pos, track_len)
+                if active_idx != last_active_lyric_idx:
+                    last_active_lyric_idx = active_idx
+                    last_lyric_change_time = now
+
+                lyric_lines = format_single_lyric_panel(
+                    lyrics_snap, current_pos, track_len, lyrics_w, cached_accent,
+                    is_compact, now, last_lyric_change_time
+                )
+                if lyric_lines != last_displayed_lyric_panel or size_changed or track_changed:
+                    last_displayed_lyric_panel = lyric_lines
+                    for r_idx, lline in enumerate(lyric_lines):
+                        row_num = meta_top + r_idx
+                        sys.stdout.write(f"\033[{row_num};{lyrics_col}H{lline}\033[K")
+
+            # 4. Render spectrum bars (25 FPS)
+            header_bottom = max(
+                (img_row + cover_h - 1) if show_cover else 0,
+                meta_top + (6 if is_compact else 7) - 1
+            )
+            spectrum_gap = 1 if term_h >= 16 else 0
+            spectrum_top = header_bottom + 1 + spectrum_gap
+            spectrum_height = max(1, term_h - spectrum_top)
+
+            with cava_lock:
+                vals = list(cava_values)
+
+            spectrum_values = expand_bars(vals, term_w)
+            heights = [
+                max(0, min(spectrum_height, int(v / 1000 * spectrum_height)))
+                for v in spectrum_values
+            ]
+
+            r, g, b = cached_accent
+            accent_bar = f"\033[38;2;{r};{g};{b}m{BAR}{RESET}"
+
+            for row_idx in range(spectrum_height, 0, -1):
+                curr_row = spectrum_top + (spectrum_height - row_idx)
+                row_chars = []
+                for h in heights:
+                    if h >= row_idx:
+                        row_chars.append(accent_bar)
+                    else:
+                        row_chars.append(" ")
+                sys.stdout.write(f"\033[{curr_row};1H" + "".join(row_chars) + "\033[K")
+
+            sys.stdout.flush()
+
+            # 5. Precise clock sleep to preserve 25 FPS frame pacing
+            elapsed_frame = time.monotonic() - now
+            sleep_time = max(0.001, tick_interval - elapsed_frame)
+            time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
+
+
+
+def parse_arguments(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(
+        prog="cavac",
+        description="Cyan CAVA audio visualizer & minimalist music dashboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cavac                                Classic full-screen animated cyan spectrum
+  cavac -meta                          Minimalist music dashboard with high-res artwork & dynamic theme
+  cavac -meta -rotate                  Rotating circular vinyl record with dynamic theme
+  cavac -meta -lyrics                  Synchronized lyrics panel with live tracking
+  cavac -meta -rotate -lyrics          Complete dashboard: vinyl + metadata + lyrics + spectrum
+  cavac -meta --no-cover               Music dashboard without album artwork
+  cavac -meta --compact                Compact dashboard layout for smaller terminals
+"""
+    )
+    parser.add_argument(
+        "-meta", "--meta",
+        action="store_true",
+        help="Display minimalist music metadata & high-res artwork above spectrum visualizer"
+    )
+    parser.add_argument(
+        "-rotate", "--rotate",
+        action="store_true",
+        help="Display album artwork as an animated rotating circular vinyl record"
+    )
+    parser.add_argument(
+        "-lyrics", "--lyrics",
+        action="store_true",
+        help="Display synchronized lyrics panel on the right side of the screen"
+    )
+    parser.add_argument(
+        "--no-cover",
+        action="store_true",
+        help="Display metadata and progress without album artwork"
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Compact metadata layout"
+    )
+
+    args = parser.parse_args(argv)
+    if args.no_cover or args.compact or args.rotate or args.lyrics:
+        args.meta = True
+
+    return args
+
+
+
+def main():
+    args = parse_arguments()
+    if args.meta:
+        run_meta(args)
+    else:
+        run_classic()
+
+
+if __name__ == "__main__":
+    main()
