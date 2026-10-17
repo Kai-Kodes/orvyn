@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# cavac installer
-# Installs cavac to ~/.local/bin and sets up the recommended CAVA configuration.
+# ORVYN installer
+# Installs orvyn to ~/.local/bin and sets up the recommended CAVA configuration.
+# Provides backward-compatibility symlink for legacy 'cavac' commands.
 # ==============================================================================
 
 set -euo pipefail
@@ -9,26 +10,55 @@ set -euo pipefail
 BIN_DIR="${HOME}/.local/bin"
 CONFIG_DIR="${HOME}/.config/cava"
 CONFIG_FILE="${CONFIG_DIR}/custom.conf"
+CACHE_DIR="${HOME}/.cache/orvyn"
+LEGACY_CACHE_DIR="${HOME}/.cache/cavac"
 SCRIPT_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-echo "=== Installing cavac ==="
+echo "=== Installing ORVYN ==="
 
 # 1. Ensure target directories exist
 mkdir -p "${BIN_DIR}"
 mkdir -p "${CONFIG_DIR}"
+mkdir -p "${CACHE_DIR}/covers"
+mkdir -p "${CACHE_DIR}/lyrics"
 
-# 2. Install executable
-if [ -f "${BIN_DIR}/cavac" ]; then
-    BACKUP="${BIN_DIR}/cavac.bak.$(date +%Y%m%d_%H%M%S)"
-    echo "Backing up existing cavac to ${BACKUP}..."
-    cp -p "${BIN_DIR}/cavac" "${BACKUP}"
+# 2. Migrate legacy cache if present
+if [ -d "${LEGACY_CACHE_DIR}" ]; then
+    echo "Migrating legacy cache from ${LEGACY_CACHE_DIR} to ${CACHE_DIR}..."
+    if [ -d "${LEGACY_CACHE_DIR}/covers" ]; then
+        cp -rn "${LEGACY_CACHE_DIR}/covers/"* "${CACHE_DIR}/covers/" 2>/dev/null || true
+    fi
+    if [ -d "${LEGACY_CACHE_DIR}/lyrics" ]; then
+        cp -rn "${LEGACY_CACHE_DIR}/lyrics/"* "${CACHE_DIR}/lyrics/" 2>/dev/null || true
+    fi
 fi
 
-echo "Installing cavac to ${BIN_DIR}/cavac..."
-cp -p "${SCRIPT_SRC}/cavac" "${BIN_DIR}/cavac"
-chmod +x "${BIN_DIR}/cavac"
+# 3. Install executable
+if [ -f "${BIN_DIR}/orvyn" ] && [ ! -L "${BIN_DIR}/orvyn" ]; then
+    BACKUP="${BIN_DIR}/orvyn.bak.$(date +%Y%m%d_%H%M%S)"
+    echo "Backing up existing orvyn to ${BACKUP}..."
+    cp -p "${BIN_DIR}/orvyn" "${BACKUP}"
+fi
 
-# 3. Configure CAVA
+echo "Installing orvyn to ${BIN_DIR}/orvyn..."
+cp -p "${SCRIPT_SRC}/orvyn" "${BIN_DIR}/orvyn"
+chmod +x "${BIN_DIR}/orvyn"
+
+# 4. Backward-compatibility symlink for cavac
+if [ -e "${BIN_DIR}/cavac" ]; then
+    if [ -L "${BIN_DIR}/cavac" ]; then
+        rm -f "${BIN_DIR}/cavac"
+    else
+        BACKUP="${BIN_DIR}/cavac.bak.$(date +%Y%m%d_%H%M%S)"
+        echo "Backing up existing cavac to ${BACKUP}..."
+        cp -p "${BIN_DIR}/cavac" "${BACKUP}"
+        rm -f "${BIN_DIR}/cavac"
+    fi
+fi
+echo "Creating backward-compatibility symlink: ${BIN_DIR}/cavac -> ${BIN_DIR}/orvyn..."
+ln -sf "${BIN_DIR}/orvyn" "${BIN_DIR}/cavac"
+
+# 5. Configure CAVA
 if [ -f "${CONFIG_FILE}" ]; then
     echo "Found existing CAVA configuration at ${CONFIG_FILE} (preserving untouched)."
 else
@@ -36,7 +66,7 @@ else
     cp -p "${SCRIPT_SRC}/cava.conf" "${CONFIG_FILE}"
 fi
 
-# 4. Dependency checks
+# 6. Dependency checks
 echo ""
 echo "=== Checking dependencies ==="
 
@@ -71,7 +101,7 @@ else
     echo "Note: Install any missing packages listed above for full functionality."
 fi
 
-# 5. PATH check
+# 7. PATH check
 if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
     echo ""
     echo "Notice: ${BIN_DIR} is not in your current PATH."
@@ -80,4 +110,5 @@ if [[ ":$PATH:" != *":${BIN_DIR}:"* ]]; then
 fi
 
 echo ""
-echo "cavac installation complete! Run 'cavac --help' to get started."
+echo "ORVYN installation complete! Run 'orvyn --help' to get started."
+echo "(Legacy 'cavac' command is preserved as a backward-compatibility symlink)."

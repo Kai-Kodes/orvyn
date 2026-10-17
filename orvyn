@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-cavac - Cyan CAVA terminal audio visualizer & music dashboard.
+ORVYN - Cyan CAVA terminal audio visualizer & music dashboard.
 
 Usage:
-    cavac                     Classic full-screen animated cyan spectrum.
-    cavac -meta, --meta       Minimalist music dashboard with high-res album artwork & dynamic theme.
-    cavac -meta --no-cover    Metadata dashboard without album artwork.
-    cavac -meta --compact     Compact metadata layout leaving more space for spectrum.
+    orvyn                     Classic full-screen animated cyan spectrum.
+    orvyn -meta, --meta       Minimalist music dashboard with high-res album artwork & dynamic theme.
+    orvyn -meta --no-cover    Metadata dashboard without album artwork.
+    orvyn -meta --compact     Compact metadata layout leaving more space for spectrum.
 """
 
 import argparse
@@ -36,9 +36,40 @@ except ImportError:
     ImageDraw = None
 
 CONFIG = os.path.expanduser("~/.config/cava/custom.conf")
-CACHE_DIR = os.path.expanduser("~/.cache/cavac/covers")
-CACHE_DIR_LYRICS = os.path.expanduser("~/.cache/cavac/lyrics")
+CACHE_DIR = os.path.expanduser("~/.cache/orvyn/covers")
+CACHE_DIR_LYRICS = os.path.expanduser("~/.cache/orvyn/lyrics")
 CACHE_SCHEMA_VERSION = 3
+
+
+def ensure_cache_directories():
+    """Ensure ~/.cache/orvyn directories exist and migrate legacy ~/.cache/cavac data if present."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        os.makedirs(CACHE_DIR_LYRICS, exist_ok=True)
+        legacy_root = os.path.expanduser("~/.cache/cavac")
+        if os.path.isdir(legacy_root):
+            legacy_covers = os.path.join(legacy_root, "covers")
+            if os.path.isdir(legacy_covers):
+                for item in os.listdir(legacy_covers):
+                    src = os.path.join(legacy_covers, item)
+                    dst = os.path.join(CACHE_DIR, item)
+                    if not os.path.exists(dst) and os.path.isfile(src):
+                        try:
+                            shutil.copy2(src, dst)
+                        except Exception:
+                            pass
+            legacy_lyrics = os.path.join(legacy_root, "lyrics")
+            if os.path.isdir(legacy_lyrics):
+                for item in os.listdir(legacy_lyrics):
+                    src = os.path.join(legacy_lyrics, item)
+                    dst = os.path.join(CACHE_DIR_LYRICS, item)
+                    if not os.path.exists(dst) and os.path.isfile(src):
+                        try:
+                            shutil.copy2(src, dst)
+                        except Exception:
+                            pass
+    except Exception:
+        pass
 
 # Classic Visualizer Configuration (Preserved 100%)
 BAR = "━"
@@ -539,7 +570,7 @@ class MetadataWorker:
         self.no_cover = no_cover
         self.lock = threading.Lock()
         self.running = True
-        os.makedirs(CACHE_DIR, exist_ok=True)
+        ensure_cache_directories()
 
         self.last_art_url = None
         self.last_art_path = None
@@ -605,11 +636,19 @@ class MetadataWorker:
             url_hash = hashlib.sha256(fetch_url.encode("utf-8")).hexdigest()[:20]
             cached_dst = os.path.join(CACHE_DIR, f"{url_hash}.img")
 
+            if not os.path.isfile(cached_dst):
+                legacy_file = os.path.join(os.path.expanduser("~/.cache/cavac/covers"), f"{url_hash}.img")
+                if os.path.isfile(legacy_file) and os.path.getsize(legacy_file) > 0:
+                    try:
+                        shutil.copy2(legacy_file, cached_dst)
+                    except Exception:
+                        pass
+
             if os.path.isfile(cached_dst) and os.path.getsize(cached_dst) > 0:
                 return cached_dst
 
             try:
-                req = urllib.request.Request(fetch_url, headers={"User-Agent": "cavac-meta/2.0"})
+                req = urllib.request.Request(fetch_url, headers={"User-Agent": "orvyn-meta/3.2"})
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
                     data = resp.read(5 * 1024 * 1024)
                     tmp_file = cached_dst + ".tmp"
@@ -621,7 +660,7 @@ class MetadataWorker:
                 # If enhanced URL failed, try original URL
                 if fetch_url != art_url:
                     try:
-                        req = urllib.request.Request(art_url, headers={"User-Agent": "cavac-meta/2.0"})
+                        req = urllib.request.Request(art_url, headers={"User-Agent": "orvyn-meta/3.2"})
                         with urllib.request.urlopen(req, timeout=3.0) as resp:
                             data = resp.read(5 * 1024 * 1024)
                             tmp_file = cached_dst + ".tmp"
@@ -1316,7 +1355,7 @@ class LRCLIBLyricsProvider:
 
     def __init__(self, timeout: float = 4.0):
         self.timeout = timeout
-        self.user_agent = "cavac/3.1 (https://github.com/cavac)"
+        self.user_agent = "orvyn/3.2 (https://github.com/Kai-Kodes/orvyn)"
 
     def _query_api(self, url: str) -> dict | list | None:
         try:
@@ -1464,6 +1503,14 @@ class LyricsWorker:
         key_raw = f"v{CACHE_SCHEMA_VERSION}:{artist.strip().lower()}:{title.strip().lower()}"
         key = hashlib.sha256(key_raw.encode("utf-8")).hexdigest()[:24]
         cache_path = os.path.join(CACHE_DIR_LYRICS, f"v{CACHE_SCHEMA_VERSION}_{key}.json")
+
+        if not os.path.isfile(cache_path):
+            legacy_cache = os.path.join(os.path.expanduser("~/.cache/cavac/lyrics"), f"v{CACHE_SCHEMA_VERSION}_{key}.json")
+            if os.path.isfile(legacy_cache):
+                try:
+                    shutil.copy2(legacy_cache, cache_path)
+                except Exception:
+                    pass
 
         if os.path.isfile(cache_path):
             try:
@@ -1718,7 +1765,7 @@ def format_minimalist_metadata(meta, text_w: int, accent_rgb: tuple, compact: bo
 
 
 def run_classic():
-    """Exact original cavac behavior."""
+    """Exact original classic spectrum behavior."""
     mouse_hider = MouseCursorHider(timeout=3.0)
     mouse_hider.start()
 
@@ -2104,18 +2151,18 @@ def parse_arguments(argv=None):
         argv = sys.argv[1:]
 
     parser = argparse.ArgumentParser(
-        prog="cavac",
-        description="Cyan CAVA audio visualizer & minimalist music dashboard",
+        prog="orvyn",
+        description="ORVYN - Cyan CAVA terminal audio visualizer & minimalist music dashboard",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  cavac                                Classic full-screen animated cyan spectrum
-  cavac -meta                          Minimalist music dashboard with high-res artwork & dynamic theme
-  cavac -meta -rotate                  Rotating circular vinyl record with dynamic theme
-  cavac -meta -lyrics                  Synchronized lyrics panel with live tracking
-  cavac -meta -rotate -lyrics          Complete dashboard: vinyl + metadata + lyrics + spectrum
-  cavac -meta --no-cover               Music dashboard without album artwork
-  cavac -meta --compact                Compact dashboard layout for smaller terminals
+  orvyn                                Classic full-screen animated cyan spectrum
+  orvyn -meta                          Minimalist music dashboard with high-res artwork & dynamic theme
+  orvyn -meta -rotate                  Rotating circular vinyl record with dynamic theme
+  orvyn -meta -lyrics                  Synchronized lyrics panel with live tracking
+  orvyn -meta -rotate -lyrics          Complete dashboard: vinyl + metadata + lyrics + spectrum
+  orvyn -meta --no-cover               Music dashboard without album artwork
+  orvyn -meta --compact                Compact dashboard layout for smaller terminals
 """
     )
     parser.add_argument(
@@ -2142,6 +2189,11 @@ Examples:
         "--compact",
         action="store_true",
         help="Compact metadata layout"
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version="ORVYN 3.2.0"
     )
 
     args = parser.parse_args(argv)

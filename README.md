@@ -1,8 +1,8 @@
-# cavac
+# ORVYN
 
 > **CAVA-powered terminal audio visualizer & minimalist music dashboard**
 
-`cavac` transforms [CAVA](https://github.com/karlstav/cava)'s raw audio spectrum into an artwork-first terminal music dashboard. Designed natively for modern terminal emulators like **WezTerm**, `cavac` combines real-time spectrum visualization with live MPRIS track metadata, high-resolution album artwork, dynamic color palettes, animated rotating vinyl records, and genuine line-level synchronized lyrics.
+`orvyn` transforms [CAVA](https://github.com/karlstav/cava)'s raw audio spectrum into an artwork-first terminal music dashboard. Designed natively for modern terminal emulators like **WezTerm**, `orvyn` combines real-time spectrum visualization with live MPRIS track metadata, high-resolution album artwork, dynamic color palettes, animated rotating vinyl records, and genuine line-level synchronized lyrics.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -24,18 +24,19 @@
 
 ## Features
 
-- **Classic CAVA Audio Spectrum**: Run `cavac` without arguments to get the original, ultra-responsive cyan audio spectrum visualizer powered directly by CAVA.
+- **Classic CAVA Audio Spectrum**: Run `orvyn` without arguments to get the original, ultra-responsive cyan audio spectrum visualizer powered directly by CAVA.
 - **Minimalist Artwork & Metadata Dashboard (`-meta`)**: High-resolution album cover art rendered natively in your terminal via the iTerm2/WezTerm inline image protocol, paired with live track title, artist, album name, player identity, and progress bar.
 - **Dynamic Artwork-Derived Accent Colors**: Automatically extracts the dominant vibrance from the album cover art and styles the spectrum bars, progress indicator, and active lyrics to match the album palette (with fallback to default cyan `#00d7ff`).
 - **Smooth Rotating Vinyl Record (`-rotate`)**: Pre-computes smooth 25 FPS rotation frames of the album artwork mapped onto a vinyl disc with realistic vinyl grooves, center label, and spindle hole, advancing with sub-second monotonic timing.
 - **True Line-Level Synchronized Lyrics (`-lyrics`)**: A dedicated side panel displaying the active lyric sentence at the exact millisecond it is sung.
   - **Honest Sync**: Genuinely timestamped `.lrc` lines track active playback with sub-second precision.
-  - **Zero Fabrication**: If a track only provides plain unsynchronized lyrics, `cavac` displays a subtle `Synced lyrics unavailable` message rather than inventing fake timestamps or linearly distributing lines across the song duration.
+  - **Zero Fabrication**: If a track only provides plain unsynchronized lyrics, `orvyn` displays a subtle `Synced lyrics unavailable` message rather than inventing fake timestamps or linearly distributing lines across the song duration.
   - **Smart Intros & Breaks**: Displays an ambient note indicator (`♪`) during instrumental intros and breaks, never jumping to lyric lines early.
 - **Strict Candidate Validation Engine**: Matches songs against primary artists and base titles while penalizing unrequested remixes, live recordings, acoustic versions, slowed/reverb edits, karaoke, and sped-up tracks.
 - **Intelligent Sub-Second Timing**: Uses CPU monotonic-clock extrapolation between MPRIS polls, freezes lyric progression immediately when playback is paused, and realigns instantly on forward or backward seeks.
 - **Automatic Mouse Cursor Hiding**: Hides the mouse pointer after 3 seconds of inactivity inside the window on X11 and immediately restores it upon pointer movement.
 - **Responsive Layout & Clean Exit**: Gracefully adapts to terminal resize events and restores terminal state cleanly upon exit (`Ctrl+C` or `SIGTERM`).
+- **Backward Compatibility**: Full backward compatibility shim provided for legacy `cavac` scripts and workflows.
 
 ---
 
@@ -47,11 +48,11 @@ sudo apt update
 sudo apt install -y cava playerctl python3 python3-pil libx11-6
 ```
 
-### 2. Install cavac
+### 2. Install ORVYN
 Clone the repository and run the automated installer:
 ```bash
-git clone https://github.com/Kai-Kodes/cavac.git
-cd cavac
+git clone https://github.com/Kai-Kodes/orvyn.git
+cd orvyn
 ./install.sh
 ```
 
@@ -62,62 +63,72 @@ cd cavac
 ## Usage
 
 ```text
-usage: cavac [-h] [-meta] [-rotate] [-lyrics] [--no-cover] [--compact]
+usage: orvyn [-h] [-meta] [-rotate] [-lyrics] [--no-cover] [--compact] [-v]
 
-Cyan CAVA audio visualizer & minimalist music dashboard
+ORVYN - Cyan CAVA terminal audio visualizer & minimalist music dashboard
 
 options:
   -h, --help         Show this help message and exit
-  -meta, --meta      Display minimalist music metadata & high-res artwork above spectrum
+  -meta, --meta      Display minimalist music metadata & high-res artwork above spectrum visualizer
   -rotate, --rotate  Display album artwork as an animated rotating circular vinyl record
   -lyrics, --lyrics  Display synchronized lyrics panel on the right side of the screen
   --no-cover         Display metadata and progress without album artwork
   --compact          Compact metadata layout for smaller terminal windows
+  -v, --version      Show program's version number and exit
 ```
 
 ### Examples
 
 #### 1. Classic Visualizer
 ```bash
-cavac
+orvyn
 ```
 Runs the classic full-screen animated cyan audio spectrum visualizer.
 
 #### 2. Music Dashboard
 ```bash
-cavac -meta
+orvyn -meta
 ```
 Displays native high-resolution album cover, track metadata, live progress bar, and dynamic artwork-colored spectrum bars.
 
 #### 3. Rotating Vinyl Record
 ```bash
-cavac -meta -rotate
+orvyn -meta -rotate
 ```
 Renders the album cover as an animated rotating vinyl disc spinning at 25 FPS.
 
 #### 4. Synchronized Lyrics
 ```bash
-cavac -meta -lyrics
+orvyn -meta -lyrics
 ```
 Displays the minimalist dashboard with a dedicated active lyric sentence panel on the right.
 
 #### 5. Full Experience: Vinyl + Lyrics + Spectrum
 ```bash
-cavac -meta -rotate -lyrics
+orvyn -meta -rotate -lyrics
 ```
 The complete terminal music station: rotating vinyl disc on the left, track metadata in the center, synchronized lyrics on the right, and dynamic spectrum bars below.
 
 #### 6. Text-Only Dashboard (No Artwork)
 ```bash
-cavac -meta --no-cover -lyrics
+orvyn -meta --no-cover -lyrics
 ```
 Ideal for terminals without inline image support or minimal resource usage.
 
 ---
 
+## Backward Compatibility
+
+`orvyn` provides seamless backward compatibility with existing installations:
+- The installer automatically creates a symlink at `~/.local/bin/cavac` pointing to `~/.local/bin/orvyn`.
+- Existing cache files from `~/.cache/cavac` are migrated to `~/.cache/orvyn` automatically without re-downloading artwork or lyrics.
+- Calling `cavac` in any existing script or terminal session executes `orvyn` with identical parameters.
+
+---
+
 ## How Lyrics Synchronization Works
 
-`cavac` implements a strict line-level synchronization engine:
+`orvyn` implements a strict line-level synchronization engine:
 
 1. **Provider Priority**:
    - **YouTube Music InnerTube API**: Queried first with strict candidate verification. If the response contains real timestamps, it is accepted as synchronized. Plain text lyrics are retained as unsynchronized.
@@ -127,7 +138,7 @@ Ideal for terminals without inline image support or minimal resource usage.
    - Multiple timestamps per line (e.g. repeated choruses `[00:15.50][00:25.50]Chorus`).
    - Millisecond offset adjustments via `[offset:+/-ms]` tags.
 3. **Playback Tracking**:
-   - At position $t$, `cavac` displays the lyric event where timestamp $\le t$.
+   - At position $t$, `orvyn` displays the lyric event where timestamp $\le t$.
    - Extrapolates position with monotonic microsecond timing between MPRIS polling cycles (5 Hz / 0.20s).
    - Pausing freezes time progression immediately.
    - Seeking forward or backward recalibrates the active line instantaneously.
@@ -148,13 +159,13 @@ Ideal for terminals without inline image support or minimal resource usage.
 | **Alacritty / GNOME Terminal** | ✓ | ✓ (`--no-cover`) | Not supported by terminal |
 
 > [!NOTE]
-> Terminals that do not support inline image escape sequences can run `cavac -meta --no-cover` or `cavac -meta --no-cover -lyrics` for a full text-based experience.
+> Terminals that do not support inline image escape sequences can run `orvyn -meta --no-cover` or `orvyn -meta --no-cover -lyrics` for a full text-based experience.
 
 ---
 
 ## Configuration
 
-`cavac` reads its CAVA settings from `~/.config/cava/custom.conf`. A recommended configuration file is provided in [`cava.conf`](cava.conf):
+`orvyn` reads its CAVA settings from `~/.config/cava/custom.conf`. A recommended configuration file is provided in [`cava.conf`](cava.conf):
 
 ```ini
 [general]
@@ -199,7 +210,7 @@ waves = 0
 
 ### Lyrics Unavailable
 - Synchronized lyrics require verified, line-level timestamped `.lrc` data from LRCLIB or YouTube Music. Not all songs, remixes, or obscure tracks have community-submitted timestamped lyrics.
-- When timestamped lyrics do not exist, `cavac` honestly displays `Synced lyrics unavailable`.
+- When timestamped lyrics do not exist, `orvyn` honestly displays `Synced lyrics unavailable`.
 
 ### Audio Visualizer Bars Not Moving
 - Check if CAVA is receiving audio from your server:
@@ -219,10 +230,10 @@ waves = 0
 
 ## Uninstallation
 
-To uninstall `cavac`:
+To uninstall `orvyn` and remove the legacy symlink:
 ```bash
-rm -f ~/.local/bin/cavac
-rm -rf ~/.cache/cavac
+rm -f ~/.local/bin/orvyn ~/.local/bin/cavac
+rm -rf ~/.cache/orvyn ~/.cache/cavac
 ```
 *(Your custom CAVA configuration at `~/.config/cava/custom.conf` is preserved.)*
 

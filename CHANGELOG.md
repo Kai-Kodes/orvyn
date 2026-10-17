@@ -1,9 +1,20 @@
 # Changelog
 
-All notable changes to `cavac` are documented in this file.
+All notable changes to `orvyn` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [3.2.0] - 2026-10-17
+
+### Changed
+- **Project Renamed to ORVYN**: Officially rebranded project from CAVAC to **ORVYN**.
+- **Executable & CLI**: Migrated main command and executable to `orvyn` (`~/.local/bin/orvyn`), featuring self-identification as ORVYN and `-v`/`--version` support.
+- **Backward Compatibility**: Automated creation of `cavac` symlink pointing to `orvyn`, ensuring existing user scripts, aliases, and habits continue working seamlessly without duplicate or conflicting binaries.
+- **Cache Migration**: Migrated runtime artwork and lyrics caches to `~/.cache/orvyn` with automatic backward-compatible migration preserving existing cached data from `~/.cache/cavac`.
+- **Repository URLs**: Updated all repository links and documentation to `https://github.com/Kai-Kodes/orvyn`.
+
+---
 
 ## [3.1.0] - 2026-10-17
 
@@ -27,7 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Schema 3 Cache Isolation (`v3_{hash}.json`)**: Caches track fingerprint, matched candidate metadata, provider, and genuine timestamped events, preventing old plain-text cache entries from being misidentified as synchronized.
 
 ### Changed
-- **Honest Sync Presentation**: If genuine line-level timestamps are unavailable, `cavac` displays a tasteful, subdued `Synced lyrics unavailable` message. Eliminated approximate line distribution over track duration.
+- **Honest Sync Presentation**: If genuine line-level timestamps are unavailable, `orvyn` displays a tasteful, subdued `Synced lyrics unavailable` message. Eliminated approximate line distribution over track duration.
 - **Provider Priority Pipeline**:
   1. YouTube Music InnerTube API (inspected for timestamps; plain text classified as `unsynced`).
   2. LRCLIB API (`/api/get` exact query followed by `/api/search` with candidate validation).

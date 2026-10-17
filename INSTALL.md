@@ -1,12 +1,12 @@
-# Installation Guide for cavac
+# Installation Guide for ORVYN
 
-This guide details how to install, configure, and verify `cavac` on Debian, Ubuntu, and other Linux distributions.
+This guide details how to install, configure, and verify `orvyn` on Debian, Ubuntu, Arch Linux, Fedora, and other Linux distributions.
 
 ---
 
 ## Prerequisites & Dependencies
 
-`cavac` requires Python 3.10+, CAVA, and a few lightweight system utilities:
+`orvyn` requires Python 3.10+, CAVA, and a few lightweight system utilities:
 
 ### 1. Debian / Ubuntu / Linux Mint
 ```bash
@@ -40,16 +40,18 @@ sudo dnf install cava playerctl python3 python3-pillow libX11
 Clone the repository and run the provided installation script:
 
 ```bash
-git clone https://github.com/Kai-Kodes/cavac.git
-cd cavac
+git clone https://github.com/Kai-Kodes/orvyn.git
+cd orvyn
 ./install.sh
 ```
 
 The script will:
-1. Back up any existing `~/.local/bin/cavac` with a timestamp before updating.
-2. Install the `cavac` executable to `~/.local/bin/cavac`.
-3. Check for `~/.config/cava/custom.conf`. If missing, installs the recommended `cava.conf`. Existing CAVA configurations are preserved untouched.
-4. Verify all system dependencies and report any missing packages.
+1. Back up any existing `~/.local/bin/orvyn` and legacy `~/.local/bin/cavac` with timestamps.
+2. Install the `orvyn` executable to `~/.local/bin/orvyn`.
+3. Create a backward-compatibility symlink `~/.local/bin/cavac -> ~/.local/bin/orvyn`.
+4. Migrate existing cached artwork and lyrics from `~/.cache/cavac` to `~/.cache/orvyn`.
+5. Check for `~/.config/cava/custom.conf`. If missing, installs the recommended `cava.conf`. Existing personal CAVA configurations are preserved untouched.
+6. Verify all system dependencies and report any missing packages.
 
 ---
 
@@ -60,8 +62,9 @@ If you prefer to configure everything manually:
 1. **Install the executable**:
    ```bash
    mkdir -p ~/.local/bin
-   cp cavac ~/.local/bin/cavac
-   chmod +x ~/.local/bin/cavac
+   cp orvyn ~/.local/bin/orvyn
+   chmod +x ~/.local/bin/orvyn
+   ln -sf ~/.local/bin/orvyn ~/.local/bin/cavac
    ```
 
 2. **Ensure `~/.local/bin` is in your `PATH`**:
@@ -86,12 +89,12 @@ If you prefer to configure everything manually:
 
 | Mode | Supported Terminals | Protocol |
 | :--- | :--- | :--- |
-| **Classic Visualizer (`cavac`)** | Any terminal emulator | ANSI 256-color / 24-bit RGB |
+| **Classic Visualizer (`orvyn`)** | Any terminal emulator | ANSI 256-color / 24-bit RGB |
 | **Dashboard (`--no-cover`)** | Any terminal emulator | ANSI 24-bit Truecolor |
 | **Artwork & Rotating Vinyl** | WezTerm, iTerm2, Konsole, Ghostty | iTerm2 inline image escape protocol |
 
 > [!TIP]
-> If your terminal emulator does not support the iTerm2 inline image protocol, use `cavac -meta --no-cover` to enjoy full track metadata, progress indicators, synchronized lyrics, and audio visualizer spectrum without inline images.
+> If your terminal emulator does not support the iTerm2 inline image protocol, use `orvyn -meta --no-cover` to enjoy full track metadata, progress indicators, synchronized lyrics, and audio visualizer spectrum without inline images.
 
 ---
 
@@ -114,15 +117,15 @@ If you are using pure ALSA or JACK, edit `~/.config/cava/custom.conf` and adjust
 
 ## Uninstallation
 
-To remove `cavac`:
+To remove `orvyn` and the compatibility symlink:
 
 ```bash
-rm -f ~/.local/bin/cavac
+rm -f ~/.local/bin/orvyn ~/.local/bin/cavac
 ```
 
 Optionally remove cached artwork and lyrics:
 ```bash
-rm -rf ~/.cache/cavac
+rm -rf ~/.cache/orvyn ~/.cache/cavac
 ```
 
 *(Your personal `~/.config/cava/custom.conf` is preserved unless manually deleted.)*
